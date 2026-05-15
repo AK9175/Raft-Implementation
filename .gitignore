@@ -1,0 +1,15 @@
+# binaries
+*.exe
+*.out
+/bin/
+
+# build cache
+/vendor/
+
+# test artifacts
+*.test
+*.prof
+coverage.out
+
+# OS
+.DS_Store
