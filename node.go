@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"math/rand"
 	"sync"
 	"time"
@@ -246,7 +247,7 @@ func (n *RaftNode) Run() {
 			n.mu.Lock()
 			if n.state != Leader {
 				n.becomeCandidate()
-				// go n.startElection() — added in Checkpoint 3
+				go n.startElection()
 			}
 			n.mu.Unlock()
 			resetTimer(electionTimer, n.randomElectionTimeout())
@@ -266,6 +267,74 @@ func (n *RaftNode) Run() {
 	}
 }
 
+// --- election ---
+
+// startElection runs in its own goroutine after becomeCandidate().
+// It sends RequestVote to all peers in parallel and calls becomeLeader()
+// if a majority grants their votes. Raft §5.2.
+func (n *RaftNode) startElection() {
+	// Snapshot the state we need to build the RPC args.
+	// We release the lock before sending RPCs so we don't block the event loop.
+	n.mu.Lock()
+	term := n.currentTerm
+	args := RequestVoteArgs{
+		Term:         term,
+		CandidateID:  n.id,
+		LastLogIndex: n.log.lastIndex(),
+		LastLogTerm:  n.log.lastTerm(),
+	}
+	peers := make([]string, len(n.peers))
+	copy(peers, n.peers)
+	n.mu.Unlock()
+
+	// votes starts at 1 — we already voted for ourselves in becomeCandidate.
+	// Accessed only under n.mu, so no separate mutex needed.
+	votes := 1
+	majority := (len(peers)+1)/2 + 1 // (total nodes) / 2 + 1
+
+	for _, peer := range peers {
+		go func(peer string) {
+			ctx, cancel := context.WithTimeout(context.Background(),
+				time.Duration(n.config.ElectionTimeoutMinMs)*time.Millisecond)
+			defer cancel()
+
+			reply, err := n.transport.RequestVote(ctx, peer, args)
+			if err != nil {
+				return
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			// Golden rule: step down immediately on any higher term.
+			if reply.Term > n.currentTerm {
+				n.becomeFollower(reply.Term)
+				return
+			}
+
+			// Ignore stale replies — we may have moved to a new term or already won.
+			//So basically this is running inside a goroutine, so each RPC vote reply
+			//Will run this code, and as soon as we get the majority vote, the node becomes
+			//Leader and changes its state from Candidate to Leader, so any new vote will
+			//result in return (line no 321).
+			if n.state != Candidate || n.currentTerm != term {
+				return
+			}
+
+			if !reply.VoteGranted {
+				return
+			}
+
+			votes++
+			if votes >= majority {
+				// n.state == Candidate check above ensures we only call this once:
+				// after becomeLeader sets state=Leader, subsequent goroutines return early.
+				n.becomeLeader()
+			}
+		}(peer)
+	}
+}
+
 // --- RPC handlers (called by the transport when a peer sends us an RPC) ---
 
 // HandleRequestVote processes an incoming RequestVote RPC.
@@ -276,7 +345,8 @@ func (n *RaftNode) Run() {
 func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
+	//n -> Current node instance (Follower side which has received request to vote)
+	//args -> Args sent by candidate node
 	// Step down first so reply.Term reflects the updated term.
 	// We do this so that if a node which is a stale leader can be changed to follower
 	// So such stale leaders, and stale candidates can change their state to follower
@@ -295,7 +365,23 @@ func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 		return reply
 	}
 
-	// Vote granting logic (log up-to-date check) added in Checkpoint 3.
+	// Condition 1: haven't voted for someone else this term.
+	canVote := n.votedFor == "" || n.votedFor == args.CandidateID
+
+	// Condition 2: candidate's log is at least as up-to-date as ours.
+	// Higher last term wins outright — a newer term means a more recent leader,
+	// whose entries are more authoritative regardless of log length.
+	// Only when last terms are equal does log length break the tie.
+	// Raft §5.4.1
+	candidateUpToDate := args.LastLogTerm > n.log.lastTerm() ||
+		(args.LastLogTerm == n.log.lastTerm() && args.LastLogIndex >= n.log.lastIndex())
+
+	if canVote && candidateUpToDate {
+		n.votedFor = args.CandidateID
+		n.persist() // must persist before replying — crash safety
+		reply.VoteGranted = true
+		n.notifyHeartbeat() // reset our election timer — a legitimate candidate is out there
+	}
 
 	return reply
 }

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -231,5 +232,118 @@ func TestFreshNodeNoStateFile(t *testing.T) {
 	}
 	if n.CurrentTerm() != 0 {
 		t.Fatalf("expected term 0 on fresh node, got %d", n.CurrentTerm())
+	}
+}
+
+// newCluster creates n nodes wired together via MemoryNetwork and starts them.
+// Returns nodes and a shutdown function.
+func newCluster(t *testing.T, count int) ([]*RaftNode, func()) {
+	t.Helper()
+	net := NewMemoryNetwork()
+	ids := make([]string, count)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("node%d", i+1)
+	}
+
+	nodes := make([]*RaftNode, count)
+	for i, id := range ids {
+		peers := make([]string, 0, count-1)
+		for _, other := range ids {
+			if other != id {
+				peers = append(peers, other)
+			}
+		}
+		cfg := Config{
+			ID:                   id,
+			Peers:                peers,
+			Transport:            net.Transport(id),
+			StateMachine:         noopStateMachine{},
+			ElectionTimeoutMinMs: 150,
+			ElectionTimeoutMaxMs: 300,
+			HeartbeatIntervalMs:  50,
+			DataDir:              t.TempDir(),
+		}
+		nodes[i] = NewRaftNode(cfg)
+		net.Register(id, nodes[i])
+	}
+
+	for _, node := range nodes {
+		go node.Run()
+	}
+
+	shutdown := func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}
+	return nodes, shutdown
+}
+
+// waitForLeader polls until exactly one leader exists or the deadline passes.
+func waitForLeader(t *testing.T, nodes []*RaftNode, timeout time.Duration) *RaftNode {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var leader *RaftNode
+		for _, n := range nodes {
+			if n.State() == Leader {
+				if leader != nil {
+					t.Fatal("two leaders elected simultaneously")
+				}
+				leader = n
+			}
+		}
+		if leader != nil {
+			return leader
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no leader elected within timeout")
+	return nil
+}
+
+// TestLeaderElection verifies that a 3-node cluster elects exactly one leader.
+func TestLeaderElection(t *testing.T) {
+	nodes, shutdown := newCluster(t, 3)
+	defer shutdown()
+
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	// All nodes must agree on the same term.
+	leaderTerm := leader.CurrentTerm()
+	for _, n := range nodes {
+		if term := n.CurrentTerm(); term != leaderTerm {
+			t.Errorf("term mismatch: leader term=%d, node term=%d", leaderTerm, term)
+		}
+	}
+
+	// Exactly one leader.
+	leaders := 0
+	for _, n := range nodes {
+		if n.State() == Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("expected 1 leader, got %d", leaders)
+	}
+}
+
+// TestLeaderStaysLeader verifies the leader does not get displaced when the
+// cluster is healthy — its heartbeats must suppress follower election timeouts.
+// Requires Checkpoint 4 (heartbeat sending) to pass.
+func TestLeaderStaysLeader(t *testing.T) {
+	t.Skip("requires Checkpoint 4 heartbeats — unskip after sendHeartbeats() is implemented")
+
+	nodes, shutdown := newCluster(t, 3)
+	defer shutdown()
+
+	first := waitForLeader(t, nodes, 2*time.Second)
+
+	// Wait several heartbeat intervals and confirm the same node is still leader.
+	time.Sleep(300 * time.Millisecond)
+
+	if first.State() != Leader {
+		t.Fatal("leader was displaced without any failure")
 	}
 }
