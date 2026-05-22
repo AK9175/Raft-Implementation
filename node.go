@@ -260,11 +260,59 @@ func (n *RaftNode) Run() {
 			// Send heartbeats if we are the leader.
 			n.mu.Lock()
 			if n.state == Leader {
-				// n.sendHeartbeats() — added in Checkpoint 4
+				n.sendHeartbeats()
 			}
 			n.mu.Unlock()
 		}
 	}
+}
+
+// --- heartbeats ---
+
+// sendHeartbeats sends an empty AppendEntries to every peer in parallel.
+// Called by Run() on every heartbeatTicker tick when this node is the leader.
+// Must be called with n.mu held — we snapshot state under the lock, then
+// release it before sending RPCs so the event loop stays responsive.
+// Raft §5.2: leader sends heartbeats to prevent unnecessary elections.
+func (n *RaftNode) sendHeartbeats() {
+	// Snapshot everything we need under the lock.
+	term := n.currentTerm
+	leaderID := n.id
+	commitIndex := n.commitIndex
+	peers := make([]string, len(n.peers))
+	copy(peers, n.peers)
+	n.mu.Unlock() // release before RPCs — don't block the event loop
+
+	for _, peer := range peers {
+		go func(peer string) {
+			args := AppendEntriesArgs{
+				Term:         term,
+				LeaderID:     leaderID,
+				LeaderCommit: commitIndex,
+				// PrevLogIndex, PrevLogTerm, Entries filled in Checkpoint 6
+				// For now: empty entries = pure heartbeat
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(),
+				time.Duration(n.config.HeartbeatIntervalMs)*time.Millisecond)
+			defer cancel()
+
+			reply, err := n.transport.AppendEntries(ctx, peer, args)
+			if err != nil {
+				return
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			// Golden rule: step down on any higher term.
+			if reply.Term > n.currentTerm {
+				n.becomeFollower(reply.Term)
+			}
+		}(peer)
+	}
+
+	n.mu.Lock() // reacquire — caller (Run) expects lock to be held on return
 }
 
 // --- election ---

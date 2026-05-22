@@ -333,8 +333,6 @@ func TestLeaderElection(t *testing.T) {
 // cluster is healthy — its heartbeats must suppress follower election timeouts.
 // Requires Checkpoint 4 (heartbeat sending) to pass.
 func TestLeaderStaysLeader(t *testing.T) {
-	t.Skip("requires Checkpoint 4 heartbeats — unskip after sendHeartbeats() is implemented")
-
 	nodes, shutdown := newCluster(t, 3)
 	defer shutdown()
 
