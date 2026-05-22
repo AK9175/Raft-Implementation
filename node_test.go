@@ -307,7 +307,15 @@ func TestLeaderElection(t *testing.T) {
 	nodes, shutdown := newCluster(t, 3)
 	defer shutdown()
 
-	leader := waitForLeader(t, nodes, 2*time.Second)
+	waitForLeader(t, nodes, 2*time.Second)
+
+	// Let heartbeats propagate so all nodes converge on the same term
+	// before we snapshot state for assertions.
+	time.Sleep(200 * time.Millisecond)
+
+	// Re-find the leader at assertion time — the original winner may have
+	// stepped down if a stale election bumped the term during startup.
+	leader := waitForLeader(t, nodes, time.Second)
 
 	// All nodes must agree on the same term.
 	leaderTerm := leader.CurrentTerm()
@@ -326,6 +334,68 @@ func TestLeaderElection(t *testing.T) {
 	}
 	if leaders != 1 {
 		t.Fatalf("expected 1 leader, got %d", leaders)
+	}
+}
+
+// TestLogReplication verifies that commands submitted to the leader are
+// replicated to all followers and that all nodes converge on the same log.
+func TestLogReplication(t *testing.T) {
+	nodes, shutdown := newCluster(t, 3)
+	defer shutdown()
+
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	commands := []string{"SET a 1", "SET b 2", "SET c 3", "DEL a", "SET d 4"}
+	for _, cmd := range commands {
+		idx, _, err := leader.Submit([]byte(cmd))
+		if err != nil {
+			t.Fatalf("Submit(%q) failed: %v", cmd, err)
+		}
+		if idx == 0 {
+			t.Fatalf("Submit(%q) returned index 0", cmd)
+		}
+	}
+
+	// Give replication time to propagate to all nodes.
+	time.Sleep(300 * time.Millisecond)
+
+	// Every node must have all 5 entries and agree on the same log contents.
+	for _, n := range nodes {
+		n.mu.Lock()
+		last := n.log.lastIndex()
+		entries := make([]LogEntry, last)
+		for i := uint64(1); i <= last; i++ {
+			entries[i-1] = n.log.get(i)
+		}
+		n.mu.Unlock()
+
+		if last != uint64(len(commands)) {
+			t.Errorf("node %s: expected lastIndex=%d, got %d", n.id, len(commands), last)
+			continue
+		}
+		for i, cmd := range commands {
+			if string(entries[i].Command) != cmd {
+				t.Errorf("node %s entry %d: expected %q, got %q", n.id, i+1, cmd, entries[i].Command)
+			}
+		}
+	}
+
+	// commitIndex must have advanced on the leader.
+	leader.mu.Lock()
+	ci := leader.commitIndex
+	leader.mu.Unlock()
+	if ci != uint64(len(commands)) {
+		t.Errorf("leader commitIndex: expected %d, got %d", len(commands), ci)
+	}
+}
+
+// TestSubmitOnNonLeader verifies Submit returns ErrNotLeader on followers.
+func TestSubmitOnNonLeader(t *testing.T) {
+	n, _ := newTestNode(t, "node1")
+	// node1 starts as follower
+	_, _, err := n.Submit([]byte("SET x 1"))
+	if err != ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
 	}
 }
 
