@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atharva/raft"
+	"github.com/atharva/raft/raft"
 )
 
 // newTestCluster creates count KVStore+RaftNode pairs wired together via MemoryNetwork.

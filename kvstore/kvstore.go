@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atharva/raft"
+	"github.com/atharva/raft/raft"
 )
 
 var (

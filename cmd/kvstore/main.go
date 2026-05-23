@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atharva/raft"
 	"github.com/atharva/raft/kvstore"
+	"github.com/atharva/raft/raft"
 )
 
 // peerHTTPAddrs maps node ID → HTTP address.
