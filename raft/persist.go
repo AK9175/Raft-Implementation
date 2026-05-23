@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 )
 
-// persistentState is what gets written to disk.
+// PersistedState is what gets written to disk.
 // Exactly the three fields from Raft Figure 2 that must survive a crash.
-type persistentState struct {
+type PersistedState struct {
 	CurrentTerm uint64
 	VotedFor    string
 	Entries     []LogEntry
@@ -48,7 +48,7 @@ type persistentState struct {
 //   A crash anywhere before fsync returns leaves the old raft-state.bin intact.
 //   A crash after fsync leaves the new complete file on disk.
 func (n *RaftNode) persist() {
-	state := persistentState{
+	state := PersistedState{
 		CurrentTerm: n.currentTerm,
 		VotedFor:    n.votedFor,
 		Entries:     n.log.entries,
@@ -97,7 +97,7 @@ func (n *RaftNode) loadState() error {
 	}
 	defer f.Close()
 
-	var state persistentState
+	var state PersistedState
 	if err := gob.NewDecoder(f).Decode(&state); err != nil {
 		return err
 	}

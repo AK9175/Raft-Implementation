@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -110,6 +111,10 @@ type RaftNode struct {
 	heartbeatC    chan struct{} // signals valid heartbeat/vote → reset election timer
 	commitNotifyC chan struct{} // signals commitIndex advanced → wake apply loop
 	applyCh       chan ApplyMsg // committed entries flow out to the application here
+
+	// --- diagnostics (atomic — readable without holding mu) ---
+	heartbeatsRecv atomic.Uint64 // total heartbeats received as follower
+	heartbeatsSent atomic.Uint64 // total heartbeat rounds sent as leader
 }
 
 // NewRaftNode creates a new RaftNode from the given config.
@@ -166,6 +171,28 @@ func (n *RaftNode) LeaderID() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.leaderID
+}
+
+// HeartbeatsReceived returns the total number of valid heartbeats this node
+// has accepted as a follower. Increments every ~50ms when a leader is present.
+func (n *RaftNode) HeartbeatsReceived() uint64 { return n.heartbeatsRecv.Load() }
+
+// HeartbeatsSent returns the total number of heartbeat rounds this node has
+// sent as leader (one round = one AppendEntries per peer). Increments every 50ms.
+func (n *RaftNode) HeartbeatsSent() uint64 { return n.heartbeatsSent.Load() }
+
+// CommitIndex returns the highest log index known to be committed.
+func (n *RaftNode) CommitIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
+}
+
+// LastApplied returns the highest log index applied to the state machine.
+func (n *RaftNode) LastApplied() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastApplied
 }
 
 // Stop signals the node to shut down and waits for it to finish.
@@ -265,6 +292,7 @@ func (n *RaftNode) notifyCommit() {
 func (n *RaftNode) Run() {
 	defer close(n.done)
 
+	n.loadState()          // restore term, votedFor, and log entries from disk
 	n.restoreFromSnapshot() // must run before applyLoop so the SM is ready before any Apply calls
 
 	go n.applyLoop() // apply committed entries to the state machine in the background

@@ -1,0 +1,74 @@
+version: "3.9"
+
+# Three-node Raft KVStore cluster.
+#
+# Each container runs one Raft node + KVStore HTTP server.
+# Nodes talk to each other on port 7001 (Raft RPC).
+# Clients talk to nodes on ports 8081-8083 (KVStore HTTP API).
+#
+# Start:   docker compose -f infra/docker-compose.yml up --build
+# Put:     curl -L -X PUT "http://localhost:8081/keys/hello?value=world"
+# Get:     curl -L "http://localhost:8082/keys/hello"
+# Delete:  curl -L -X DELETE "http://localhost:8083/keys/hello"
+#
+# -L tells curl to follow the 302 redirect to the leader automatically.
+#
+# PEER_HTTP_ADDRS uses localhost:808x because the redirect URL must be
+# resolvable by the *client* on the host machine, not between containers.
+
+services:
+  node1:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    environment:
+      NODE_ID: node1
+      RAFT_RPC_ADDR: ":7001"
+      RAFT_PEERS: "node2:7001,node3:7001"
+      HTTP_ADDR: ":8081"
+      PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
+      DATA_DIR: /data
+    ports:
+      - "8081:8081"
+      - "7001:7001"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    environment:
+      NODE_ID: node2
+      RAFT_RPC_ADDR: ":7001"
+      RAFT_PEERS: "node1:7001,node3:7001"
+      HTTP_ADDR: ":8082"
+      PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
+      DATA_DIR: /data
+    ports:
+      - "8082:8082"
+      - "7002:7001"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    environment:
+      NODE_ID: node3
+      RAFT_RPC_ADDR: ":7001"
+      RAFT_PEERS: "node1:7001,node2:7001"
+      HTTP_ADDR: ":8083"
+      PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
+      DATA_DIR: /data
+    ports:
+      - "8083:8083"
+      - "7003:7001"
+    volumes:
+      - node3-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

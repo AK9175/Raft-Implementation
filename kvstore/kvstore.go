@@ -55,6 +55,10 @@ type KVStore struct {
 	snapshotThreshold uint64 // take snapshot every N applied entries (0 = disabled)
 }
 
+// SetSnapshotThreshold changes how many applied entries trigger an auto-snapshot.
+// 0 disables auto-snapshotting. Safe to call before node.Run().
+func (kv *KVStore) SetSnapshotThreshold(n uint64) { kv.snapshotThreshold = n }
+
 // New creates a KVStore and a RaftNode wired together.
 // It sets cfg.StateMachine to the new store, so callers must not set it themselves.
 // The caller is responsible for starting the node: go node.Run().
@@ -78,10 +82,18 @@ func (kv *KVStore) Set(key, value string) error {
 	return err
 }
 
-// Get replicates a GET command through the log (linearizable read) and
-// returns the value. Returns ErrKeyNotFound if the key does not exist.
+// Get reads directly from the local state machine.
+// Any node (leader or follower) can serve reads without redirecting.
+// A follower that is slightly behind may return a value that is a few
+// entries stale, but replication lag is typically under one heartbeat (50ms).
 func (kv *KVStore) Get(key string) (string, error) {
-	return kv.call(op{Type: "GET", Key: key})
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	v, ok := kv.data[key]
+	if !ok {
+		return "", ErrKeyNotFound
+	}
+	return v, nil
 }
 
 // Delete replicates a DEL command and blocks until committed.
@@ -193,12 +205,6 @@ func (kv *KVStore) Apply(command []byte) interface{} {
 	case "SET":
 		kv.data[o.Key] = o.Value
 		return applyResult{}
-	case "GET":
-		v, ok := kv.data[o.Key]
-		if !ok {
-			return applyResult{Err: ErrKeyNotFound}
-		}
-		return applyResult{Value: v}
 	case "DEL":
 		delete(kv.data, o.Key)
 		return applyResult{}

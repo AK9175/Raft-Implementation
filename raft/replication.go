@@ -32,7 +32,8 @@ func (n *RaftNode) sendHeartbeats() {
 			msgs[peer] = peerMsg{useSnap: false, aeArgs: n.buildArgsLocked(peer)}
 		}
 	}
-	n.mu.Unlock() // release before RPCs — don't block the event loop
+	n.heartbeatsSent.Add(1) // one round = one tick, regardless of peer count
+	n.mu.Unlock()           // release before RPCs — don't block the event loop
 
 	for _, peer := range peers {
 		m := msgs[peer]
@@ -240,5 +241,8 @@ func (n *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRepl
 
 	n.persist()
 	reply.Success = true
+	if len(args.Entries) == 0 {
+		n.heartbeatsRecv.Add(1) // pure heartbeat (no new entries)
+	}
 	return reply
 }
