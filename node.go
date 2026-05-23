@@ -97,6 +97,10 @@ type RaftNode struct {
 	stateMachine StateMachine
 	config       Config
 
+	// --- snapshot ---
+	snapshotData    []byte               // latest snapshot bytes (nil until first snapshot)
+	snapshotNotifyC chan snapshotToApply // apply loop reads this to restore after InstallSnapshot
+
 	// --- lifecycle ---
 	stopCh        chan struct{}
 	done          chan struct{}
@@ -128,11 +132,12 @@ func NewRaftNode(cfg Config) *RaftNode {
 		transport:     cfg.Transport,
 		stateMachine:  cfg.StateMachine,
 		config:        cfg,
-		stopCh:        make(chan struct{}),
-		done:          make(chan struct{}),
-		heartbeatC:    make(chan struct{}, 1),
-		commitNotifyC: make(chan struct{}, 1),
-		applyCh:       make(chan ApplyMsg, 64),
+		snapshotNotifyC: make(chan snapshotToApply, 1),
+		stopCh:          make(chan struct{}),
+		done:            make(chan struct{}),
+		heartbeatC:      make(chan struct{}, 1),
+		commitNotifyC:   make(chan struct{}, 1),
+		applyCh:         make(chan ApplyMsg, 64),
 	}
 	return n
 }
@@ -175,8 +180,13 @@ func (n *RaftNode) Submit(command []byte) (index uint64, term uint64, err error)
 
 	// Trigger immediate replication — don't wait for the heartbeat tick.
 	for _, peer := range n.peers {
-		args := n.buildArgsLocked(peer)
-		go n.sendToPeer(peer, term, args)
+		if n.nextIndex[peer] <= n.log.snapshotIndex() {
+			snapArgs := n.buildSnapshotArgsLocked()
+			go n.sendSnapshotToPeer(peer, term, snapArgs)
+		} else {
+			args := n.buildArgsLocked(peer)
+			go n.sendToPeer(peer, term, args)
+		}
 	}
 	return index, term, nil
 }
@@ -242,6 +252,8 @@ func (n *RaftNode) notifyCommit() {
 // It drives all state transitions and coordinates timers.
 func (n *RaftNode) Run() {
 	defer close(n.done)
+
+	n.restoreFromSnapshot() // must run before applyLoop so the SM is ready before any Apply calls
 
 	go n.applyLoop() // apply committed entries to the state machine in the background
 

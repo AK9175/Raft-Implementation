@@ -20,6 +20,9 @@ func (noopTransport) RequestVote(_ context.Context, _ string, _ RequestVoteArgs)
 func (noopTransport) AppendEntries(_ context.Context, _ string, _ AppendEntriesArgs) (AppendEntriesReply, error) {
 	return AppendEntriesReply{}, nil
 }
+func (noopTransport) InstallSnapshot(_ context.Context, _ string, _ InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	return InstallSnapshotReply{}, nil
+}
 func (noopTransport) Close() error { return nil }
 
 // noopStateMachine satisfies the StateMachine interface without doing anything.
@@ -512,6 +515,184 @@ func TestApplyLoop(t *testing.T) {
 				t.Errorf("node %s apply[%d]: expected %q, got %q", ids[i], j, cmd, got[j])
 			}
 		}
+	}
+}
+
+// TestTakeSnapshot verifies that TakeSnapshot compacts the log through lastApplied,
+// updates the snapshot index, and persists the snapshot file to disk.
+func TestTakeSnapshot(t *testing.T) {
+	n, dir := newTestNode(t, "node1")
+
+	// Seed the log and set lastApplied as if three entries have been applied.
+	n.mu.Lock()
+	n.log.append(LogEntry{Term: 1, Index: 1, Command: []byte("a")})
+	n.log.append(LogEntry{Term: 1, Index: 2, Command: []byte("b")})
+	n.log.append(LogEntry{Term: 1, Index: 3, Command: []byte("c")})
+	n.log.append(LogEntry{Term: 1, Index: 4, Command: []byte("d")})
+	n.log.append(LogEntry{Term: 1, Index: 5, Command: []byte("e")})
+	n.lastApplied = 3
+	n.mu.Unlock()
+
+	if err := n.TakeSnapshot([]byte("snap-data")); err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+
+	n.mu.Lock()
+	snapIdx := n.log.snapshotIndex()
+	snapTerm := n.log.snapshotTerm()
+	lastIdx := n.log.lastIndex()
+	e2 := n.log.get(2) // compacted
+	e4 := n.log.get(4) // still present
+	n.mu.Unlock()
+
+	if snapIdx != 3 {
+		t.Fatalf("expected snapshotIndex=3, got %d", snapIdx)
+	}
+	if snapTerm != 1 {
+		t.Fatalf("expected snapshotTerm=1, got %d", snapTerm)
+	}
+	if lastIdx != 5 {
+		t.Fatalf("expected lastIndex=5 (entries 4,5 survive compaction), got %d", lastIdx)
+	}
+	if e2.Term != 0 {
+		t.Fatal("entry 2 should be compacted away")
+	}
+	if e4.Term != 1 {
+		t.Fatalf("entry 4 should still exist after compaction, got %+v", e4)
+	}
+
+	// Snapshot file must exist on disk.
+	if _, err := os.Stat(filepath.Join(dir, "raft-snapshot.bin")); err != nil {
+		t.Fatalf("snapshot file should exist: %v", err)
+	}
+
+	// Second TakeSnapshot at the same lastApplied must be a no-op.
+	if err := n.TakeSnapshot([]byte("snap-data-2")); err != nil {
+		t.Fatalf("second TakeSnapshot failed: %v", err)
+	}
+	n.mu.Lock()
+	snapIdx2 := n.log.snapshotIndex()
+	n.mu.Unlock()
+	if snapIdx2 != 3 {
+		t.Fatalf("second TakeSnapshot should be a no-op, snapshotIndex changed to %d", snapIdx2)
+	}
+}
+
+// TestInstallSnapshot verifies that HandleInstallSnapshot updates the node's
+// log boundary, applied/commit indices, and queues a restore notification.
+func TestInstallSnapshot(t *testing.T) {
+	n, _ := newTestNode(t, "node1")
+
+	// Put the node in term 1 so the incoming snapshot term is valid.
+	n.mu.Lock()
+	n.currentTerm = 1
+	n.mu.Unlock()
+
+	args := InstallSnapshotArgs{
+		Term:              1,
+		LeaderID:          "node2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Data:              []byte("snapshot-bytes"),
+	}
+	reply := n.HandleInstallSnapshot(args)
+
+	if reply.Term != 1 {
+		t.Fatalf("expected reply.Term=1, got %d", reply.Term)
+	}
+
+	n.mu.Lock()
+	snapIdx := n.log.snapshotIndex()
+	snapTerm := n.log.snapshotTerm()
+	lastApplied := n.lastApplied
+	commitIdx := n.commitIndex
+	n.mu.Unlock()
+
+	if snapIdx != 5 {
+		t.Fatalf("expected snapshotIndex=5, got %d", snapIdx)
+	}
+	if snapTerm != 1 {
+		t.Fatalf("expected snapshotTerm=1, got %d", snapTerm)
+	}
+	if lastApplied != 5 {
+		t.Fatalf("expected lastApplied=5, got %d", lastApplied)
+	}
+	if commitIdx != 5 {
+		t.Fatalf("expected commitIndex=5, got %d", commitIdx)
+	}
+
+	// The apply loop must have a pending restore notification.
+	select {
+	case snap := <-n.snapshotNotifyC:
+		if snap.index != 5 || snap.term != 1 {
+			t.Fatalf("wrong snapshot in channel: %+v", snap)
+		}
+		if string(snap.data) != "snapshot-bytes" {
+			t.Fatalf("wrong snapshot data: %q", snap.data)
+		}
+	default:
+		t.Fatal("expected a pending snapshot notification on snapshotNotifyC")
+	}
+
+	// Stale snapshot (lower index) must be rejected.
+	stale := InstallSnapshotArgs{Term: 1, LeaderID: "node2", LastIncludedIndex: 3, LastIncludedTerm: 1}
+	n.HandleInstallSnapshot(stale)
+	n.mu.Lock()
+	snapIdxAfter := n.log.snapshotIndex()
+	n.mu.Unlock()
+	if snapIdxAfter != 5 {
+		t.Fatalf("stale snapshot should not regress snapshotIndex, got %d", snapIdxAfter)
+	}
+}
+
+// TestSnapshotAndRestart verifies that a node restores its state from a snapshot
+// on restart: the state machine is restored and lastApplied/commitIndex are set.
+func TestSnapshotAndRestart(t *testing.T) {
+	n, dir := newTestNode(t, "node1")
+
+	// Simulate having applied three entries and taking a snapshot.
+	n.mu.Lock()
+	n.log.append(LogEntry{Term: 1, Index: 1, Command: []byte("a")})
+	n.log.append(LogEntry{Term: 1, Index: 2, Command: []byte("b")})
+	n.log.append(LogEntry{Term: 1, Index: 3, Command: []byte("c")})
+	n.lastApplied = 3
+	n.mu.Unlock()
+
+	if err := n.TakeSnapshot([]byte("state")); err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	// Simulate restart: fresh node, same DataDir.
+	sm := &recordingStateMachine{}
+	cfg := Config{
+		ID: "node1", Peers: []string{"node2", "node3"},
+		Transport: noopTransport{}, StateMachine: sm,
+		ElectionTimeoutMinMs: 150, ElectionTimeoutMaxMs: 300,
+		HeartbeatIntervalMs: 50, DataDir: dir,
+	}
+	n2 := NewRaftNode(cfg)
+	if err := n2.loadState(); err != nil {
+		t.Fatalf("loadState: %v", err)
+	}
+
+	// restoreFromSnapshot is called by Run(); invoke it directly here to avoid
+	// starting the full event loop in a unit test.
+	n2.restoreFromSnapshot()
+
+	n2.mu.Lock()
+	snapIdx := n2.log.snapshotIndex()
+	lastApplied := n2.lastApplied
+	commitIdx := n2.commitIndex
+	n2.mu.Unlock()
+
+	if snapIdx != 3 {
+		t.Fatalf("restarted node should have snapshotIndex=3, got %d", snapIdx)
+	}
+	if lastApplied != 3 {
+		t.Fatalf("restarted node should have lastApplied=3, got %d", lastApplied)
+	}
+	if commitIdx != 3 {
+		t.Fatalf("restarted node should have commitIndex=3, got %d", commitIdx)
 	}
 }
 

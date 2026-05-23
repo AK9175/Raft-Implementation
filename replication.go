@@ -16,16 +16,31 @@ func (n *RaftNode) sendHeartbeats() {
 	term := n.currentTerm
 	peers := make([]string, len(n.peers))
 	copy(peers, n.peers)
+	snapshotIdx := n.log.snapshotIndex()
 
 	// Build per-peer args under the lock so nextIndex/log are consistent.
-	peerArgs := make(map[string]AppendEntriesArgs, len(peers))
+	type peerMsg struct {
+		useSnap  bool
+		aeArgs   AppendEntriesArgs
+		snapArgs InstallSnapshotArgs
+	}
+	msgs := make(map[string]peerMsg, len(peers))
 	for _, peer := range peers {
-		peerArgs[peer] = n.buildArgsLocked(peer)
+		if n.nextIndex[peer] <= snapshotIdx {
+			msgs[peer] = peerMsg{useSnap: true, snapArgs: n.buildSnapshotArgsLocked()}
+		} else {
+			msgs[peer] = peerMsg{useSnap: false, aeArgs: n.buildArgsLocked(peer)}
+		}
 	}
 	n.mu.Unlock() // release before RPCs — don't block the event loop
 
 	for _, peer := range peers {
-		go n.sendToPeer(peer, term, peerArgs[peer])
+		m := msgs[peer]
+		if m.useSnap {
+			go n.sendSnapshotToPeer(peer, term, m.snapArgs)
+		} else {
+			go n.sendToPeer(peer, term, m.aeArgs)
+		}
 	}
 
 	n.mu.Lock() // reacquire — caller (Run) expects lock held on return
@@ -184,11 +199,16 @@ func (n *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRepl
 
 	// --- Append entries, resolving conflicts ---
 	// Walk through the incoming entries. For each one:
+	//   • If the entry is at or before the snapshot boundary, skip it — it's
+	//     already applied and compacted; we can't (and don't need to) re-check it.
 	//   • If we already have a matching entry at that index, skip it.
 	//   • If we have a conflicting entry (same index, different term), truncate
 	//     everything from that point and append the rest of the batch.
 	//   • If the index is past our log end, append from here onward.
 	for i, entry := range args.Entries {
+		if entry.Index <= n.log.snapshotIndex() {
+			continue // already compacted — skip without touching the log
+		}
 		existing := n.log.get(entry.Index)
 		if existing.Term == 0 {
 			// Past our log end — append this and all remaining entries.

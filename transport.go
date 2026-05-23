@@ -16,6 +16,11 @@ type Transport interface {
 	// AppendEntries sends an AppendEntries RPC to the node at addr and returns the reply.
 	AppendEntries(ctx context.Context, addr string, args AppendEntriesArgs) (AppendEntriesReply, error)
 
+	// InstallSnapshot sends an InstallSnapshot RPC to the node at addr.
+	// Used when a follower is so far behind that the leader has already compacted
+	// the entries the follower needs.
+	InstallSnapshot(ctx context.Context, addr string, args InstallSnapshotArgs) (InstallSnapshotReply, error)
+
 	// Close shuts down the transport.
 	Close() error
 }

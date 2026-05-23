@@ -38,3 +38,20 @@ type AppendEntriesReply struct {
 	ConflictIndex uint64 // first index in the log that has ConflictTerm;
 	//                      if ConflictTerm==0, this is len(followerLog)+1
 }
+
+// InstallSnapshotArgs is sent by the leader to a lagging follower whose
+// nextIndex has fallen behind the leader's snapshot boundary. Instead of
+// replaying thousands of compacted entries, the leader ships the full
+// snapshot in one RPC. Raft §7.
+type InstallSnapshotArgs struct {
+	Term              uint64 // leader's current term
+	LeaderID          string // so follower can redirect clients
+	LastIncludedIndex uint64 // snapshot covers all entries up through this index
+	LastIncludedTerm  uint64 // term of the entry at LastIncludedIndex
+	Data              []byte // raw snapshot bytes from StateMachine.Snapshot()
+}
+
+// InstallSnapshotReply is the follower's response to InstallSnapshot.
+type InstallSnapshotReply struct {
+	Term uint64 // follower's current term, for the leader to step down if stale
+}

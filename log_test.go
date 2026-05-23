@@ -246,6 +246,117 @@ func TestBatchAppend(t *testing.T) {
 	}
 }
 
+// TestCompactTo verifies that compactTo discards entries up through index,
+// makes index the new sentinel, and leaves later entries intact.
+func TestCompactTo(t *testing.T) {
+	l := newLog()
+	l.append(makeEntry(1, 1, "a"))
+	l.append(makeEntry(2, 1, "b"))
+	l.append(makeEntry(3, 2, "c"))
+	l.append(makeEntry(4, 2, "d"))
+	l.append(makeEntry(5, 2, "e"))
+
+	l.compactTo(3, 2)
+
+	if l.snapshotIndex() != 3 {
+		t.Fatalf("expected snapshotIndex=3, got %d", l.snapshotIndex())
+	}
+	if l.snapshotTerm() != 2 {
+		t.Fatalf("expected snapshotTerm=2, got %d", l.snapshotTerm())
+	}
+	if l.lastIndex() != 5 {
+		t.Fatalf("expected lastIndex=5 (entries 4,5 survive), got %d", l.lastIndex())
+	}
+
+	// Entries 1, 2 must be gone.
+	if l.get(1).Term != 0 || l.get(2).Term != 0 {
+		t.Fatal("entries 1 and 2 should be compacted away")
+	}
+
+	// Entry at snapshotIndex returns the sentinel with the correct term.
+	e3 := l.get(3)
+	if e3.Index != 3 || e3.Term != 2 {
+		t.Fatalf("get(snapshotIndex) should return sentinel {3,2}, got %+v", e3)
+	}
+
+	// Entries 4 and 5 must be intact.
+	if l.get(4).Term != 2 || string(l.get(4).Command) != "d" {
+		t.Fatalf("entry 4 should survive compaction, got %+v", l.get(4))
+	}
+	if l.get(5).Term != 2 || string(l.get(5).Command) != "e" {
+		t.Fatalf("entry 5 should survive compaction, got %+v", l.get(5))
+	}
+}
+
+// TestCompactToPastEnd verifies compactTo handles the case where the snapshot
+// index is beyond the last log entry — all entries are discarded.
+func TestCompactToPastEnd(t *testing.T) {
+	l := newLog()
+	l.append(makeEntry(1, 1, "a"))
+	l.append(makeEntry(2, 1, "b"))
+
+	l.compactTo(10, 3)
+
+	if l.snapshotIndex() != 10 {
+		t.Fatalf("expected snapshotIndex=10, got %d", l.snapshotIndex())
+	}
+	if l.lastIndex() != 10 {
+		t.Fatalf("expected lastIndex=10 (only sentinel remains), got %d", l.lastIndex())
+	}
+	if l.get(10).Term != 3 {
+		t.Fatalf("sentinel at 10 should have term 3, got %+v", l.get(10))
+	}
+}
+
+// TestCompactedSlice verifies that slice() works correctly after compaction:
+// requests that span the compaction boundary start from the first available entry.
+func TestCompactedSlice(t *testing.T) {
+	l := newLog()
+	l.append(makeEntry(1, 1, "a"))
+	l.append(makeEntry(2, 1, "b"))
+	l.append(makeEntry(3, 2, "c"))
+	l.append(makeEntry(4, 2, "d"))
+	l.append(makeEntry(5, 2, "e"))
+
+	l.compactTo(3, 2)
+
+	// Slice entirely within remaining entries.
+	entries := l.slice(4, 6)
+	if len(entries) != 2 || entries[0].Index != 4 || entries[1].Index != 5 {
+		t.Fatalf("expected entries [4,5], got %+v", entries)
+	}
+
+	// Slice spanning the compaction boundary — must start from first available (4).
+	entries = l.slice(1, 5)
+	if len(entries) != 1 || entries[0].Index != 4 {
+		t.Fatalf("expected only entry 4 when request spans boundary, got %+v", entries)
+	}
+
+	// Slice entirely before the boundary — must return nil.
+	entries = l.slice(1, 3)
+	if entries != nil {
+		t.Fatalf("expected nil for slice entirely before snapshot, got %+v", entries)
+	}
+}
+
+// TestCompactToNoOp verifies compactTo is a no-op when index <= snapshotIndex.
+func TestCompactToNoOp(t *testing.T) {
+	l := newLog()
+	l.append(makeEntry(1, 1, "a"))
+	l.append(makeEntry(2, 1, "b"))
+	l.append(makeEntry(3, 1, "c"))
+
+	l.compactTo(2, 1)
+	l.compactTo(1, 1) // must not regress
+
+	if l.snapshotIndex() != 2 {
+		t.Fatalf("compactTo with lower index should be no-op, got snapshotIndex=%d", l.snapshotIndex())
+	}
+	if l.lastIndex() != 3 {
+		t.Fatalf("entry 3 should still exist, got lastIndex=%d", l.lastIndex())
+	}
+}
+
 // TestTruncateSentinelSafe verifies truncateFrom never removes the sentinel.
 // The sentinel at index 0 must always be present.
 func TestTruncateSentinelSafe(t *testing.T) {
