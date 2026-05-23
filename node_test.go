@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -27,6 +28,30 @@ type noopStateMachine struct{}
 func (noopStateMachine) Apply(_ []byte) interface{}    { return nil }
 func (noopStateMachine) Snapshot() ([]byte, error)     { return nil, nil }
 func (noopStateMachine) Restore(_ []byte) error        { return nil }
+
+// recordingStateMachine records every command applied to it.
+// Used to verify the apply loop delivers entries in order.
+type recordingStateMachine struct {
+	mu      sync.Mutex
+	applied []string
+}
+
+func (r *recordingStateMachine) Apply(cmd []byte) interface{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.applied = append(r.applied, string(cmd))
+	return len(r.applied) // return the count as the result
+}
+func (r *recordingStateMachine) Snapshot() ([]byte, error) { return nil, nil }
+func (r *recordingStateMachine) Restore(_ []byte) error    { return nil }
+
+func (r *recordingStateMachine) Applied() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.applied))
+	copy(out, r.applied)
+	return out
+}
 
 func newTestNode(t *testing.T, id string) (*RaftNode, string) {
 	t.Helper()
@@ -396,6 +421,97 @@ func TestSubmitOnNonLeader(t *testing.T) {
 	_, _, err := n.Submit([]byte("SET x 1"))
 	if err != ErrNotLeader {
 		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+// TestApplyLoop verifies that committed entries are delivered on ApplyCh in
+// index order and that the state machine receives every command exactly once.
+func TestApplyLoop(t *testing.T) {
+	net := NewMemoryNetwork()
+	ids := []string{"node1", "node2", "node3"}
+
+	sms := make([]*recordingStateMachine, len(ids))
+	nodes := make([]*RaftNode, len(ids))
+
+	for i, id := range ids {
+		peers := make([]string, 0, len(ids)-1)
+		for _, other := range ids {
+			if other != id {
+				peers = append(peers, other)
+			}
+		}
+		sms[i] = &recordingStateMachine{}
+		cfg := Config{
+			ID: id, Peers: peers,
+			Transport:            net.Transport(id),
+			StateMachine:         sms[i],
+			ElectionTimeoutMinMs: 150, ElectionTimeoutMaxMs: 300,
+			HeartbeatIntervalMs: 50,
+			DataDir:             t.TempDir(),
+		}
+		nodes[i] = NewRaftNode(cfg)
+		net.Register(id, nodes[i])
+	}
+
+	for _, node := range nodes {
+		go node.Run()
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	commands := []string{"SET a 1", "SET b 2", "SET c 3", "DEL a", "SET d 4"}
+	for _, cmd := range commands {
+		if _, _, err := leader.Submit([]byte(cmd)); err != nil {
+			t.Fatalf("Submit(%q) failed: %v", cmd, err)
+		}
+	}
+
+	// Drain ApplyCh on the leader — must receive all 5 in order.
+	applyCh := leader.ApplyCh()
+	received := make([]ApplyMsg, 0, len(commands))
+	timeout := time.After(2 * time.Second)
+	for len(received) < len(commands) {
+		select {
+		case msg := <-applyCh:
+			received = append(received, msg)
+		case <-timeout:
+			t.Fatalf("timed out waiting for apply messages, got %d/%d", len(received), len(commands))
+		}
+	}
+
+	// Verify index, term, and command for each message.
+	for i, msg := range received {
+		if msg.Index != uint64(i+1) {
+			t.Errorf("msg[%d]: expected index %d, got %d", i, i+1, msg.Index)
+		}
+		if string(msg.Command) != commands[i] {
+			t.Errorf("msg[%d]: expected command %q, got %q", i, commands[i], msg.Command)
+		}
+		if msg.Result.(int) != i+1 {
+			t.Errorf("msg[%d]: expected result %d, got %v", i, i+1, msg.Result)
+		}
+	}
+
+	// Give followers time to apply via their own apply loops.
+	time.Sleep(300 * time.Millisecond)
+
+	// Every node's state machine must have the same commands applied in the same order.
+	for i, sm := range sms {
+		got := sm.Applied()
+		if len(got) != len(commands) {
+			t.Errorf("node %s: state machine applied %d commands, want %d", ids[i], len(got), len(commands))
+			continue
+		}
+		for j, cmd := range commands {
+			if got[j] != cmd {
+				t.Errorf("node %s apply[%d]: expected %q, got %q", ids[i], j, cmd, got[j])
+			}
+		}
 	}
 }
 
