@@ -15,6 +15,7 @@ func (n *RaftNode) becomeFollower(term uint64) {
 	n.state = Follower
 	n.currentTerm = term
 	n.votedFor = ""
+	n.leaderID = "" // unknown until we hear an AppendEntries from the new leader
 	n.persist()
 }
 
@@ -25,6 +26,7 @@ func (n *RaftNode) becomeCandidate() {
 	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
+	n.leaderID = "" // no leader while election is in progress
 	n.persist()
 	// RequestVote RPCs are sent in Checkpoint 3 (startElection)
 }
@@ -34,6 +36,7 @@ func (n *RaftNode) becomeCandidate() {
 // Raft §5.2: nextIndex initialized optimistically to lastIndex+1; matchIndex to 0.
 func (n *RaftNode) becomeLeader() {
 	n.state = Leader
+	n.leaderID = n.id // we are the leader
 	lastIndex := n.log.lastIndex()
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = lastIndex + 1

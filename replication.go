@@ -171,7 +171,8 @@ func (n *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRepl
 		return reply
 	}
 
-	// Valid message from the current leader — reset our election timer.
+	// Valid message from the current leader — reset our election timer and record who it is.
+	n.leaderID = args.LeaderID
 	n.notifyHeartbeat()
 
 	// --- Log consistency check (Raft §5.3) ---

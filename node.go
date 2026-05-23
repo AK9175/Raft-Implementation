@@ -97,6 +97,9 @@ type RaftNode struct {
 	stateMachine StateMachine
 	config       Config
 
+	// --- cluster ---
+	leaderID string // ID of the node we last heard from as leader ("" if unknown)
+
 	// --- snapshot ---
 	snapshotData    []byte               // latest snapshot bytes (nil until first snapshot)
 	snapshotNotifyC chan snapshotToApply // apply loop reads this to restore after InstallSnapshot
@@ -123,15 +126,15 @@ func NewRaftNode(cfg Config) *RaftNode {
 	}
 
 	n := &RaftNode{
-		id:            cfg.ID,
-		peers:         cfg.Peers,
-		state:         Follower,
-		log:           newLog(),
-		nextIndex:     make(map[string]uint64),
-		matchIndex:    make(map[string]uint64),
-		transport:     cfg.Transport,
-		stateMachine:  cfg.StateMachine,
-		config:        cfg,
+		id:              cfg.ID,
+		peers:           cfg.Peers,
+		state:           Follower,
+		log:             newLog(),
+		nextIndex:       make(map[string]uint64),
+		matchIndex:      make(map[string]uint64),
+		transport:       cfg.Transport,
+		stateMachine:    cfg.StateMachine,
+		config:          cfg,
 		snapshotNotifyC: make(chan snapshotToApply, 1),
 		stopCh:          make(chan struct{}),
 		done:            make(chan struct{}),
@@ -154,6 +157,15 @@ func (n *RaftNode) CurrentTerm() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.currentTerm
+}
+
+// LeaderID returns the ID of the node this node believes is the current leader.
+// Returns "" if no leader is known (e.g. right after startup or a partition).
+// Safe to call concurrently.
+func (n *RaftNode) LeaderID() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.leaderID
 }
 
 // Stop signals the node to shut down and waits for it to finish.
