@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/atharva/raft/kvstore"
@@ -63,9 +64,9 @@ func main() {
 		SelfAddr:             selfAddr,
 		Peers:                peers,
 		Transport:            transport,
-		ElectionTimeoutMinMs: 150,
-		ElectionTimeoutMaxMs: 300,
-		HeartbeatIntervalMs:  50,
+		ElectionTimeoutMinMs: envIntOrDefault("ELECTION_TIMEOUT_MIN_MS", 150),
+		ElectionTimeoutMaxMs: envIntOrDefault("ELECTION_TIMEOUT_MAX_MS", 300),
+		HeartbeatIntervalMs:  envIntOrDefault("HEARTBEAT_INTERVAL_MS", 50),
 		DataDir:              dataDir,
 	}
 
@@ -244,6 +245,16 @@ func makeAdminHandler(node *raft.RaftNode, peerHTTPAddrs map[string]string, op s
 		}
 		fmt.Fprintln(w, "OK")
 	}
+}
+
+// envIntOrDefault reads an integer from an env var, returning def if unset or invalid.
+func envIntOrDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }
 
 // parsePeerHTTPAddrs parses "node1=localhost:8081,node2=localhost:8082" into a map.

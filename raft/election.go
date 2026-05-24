@@ -123,14 +123,6 @@ func (n *RaftNode) startElection() {
 func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	//n -> Current node instance (Follower side which has received request to vote)
-	//args -> Args sent by candidate node
-	// Step down first so reply.Term reflects the updated term.
-	// We do this so that if a node which is a stale leader can be changed to follower
-	// So such stale leaders, and stale candidates can change their state to follower
-	// A node which was leader, but crashed and meanwhile a diff node started election,
-	// and when this node came back up it got the RequestVote by that candidate node with a
-	//larger term, so it demotes itself to follower
 	if args.Term > n.currentTerm {
 		n.becomeFollower(args.Term)
 	}

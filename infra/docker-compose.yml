@@ -28,6 +28,9 @@ services:
       HTTP_ADDR: ":8081"
       PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
       DATA_DIR: /data
+      ELECTION_TIMEOUT_MIN_MS: 500
+      ELECTION_TIMEOUT_MAX_MS: 1000
+      HEARTBEAT_INTERVAL_MS: 100
     ports:
       - "8081:8081"
       - "7001:7001"
@@ -45,6 +48,9 @@ services:
       HTTP_ADDR: ":8082"
       PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
       DATA_DIR: /data
+      ELECTION_TIMEOUT_MIN_MS: 500
+      ELECTION_TIMEOUT_MAX_MS: 1000
+      HEARTBEAT_INTERVAL_MS: 100
     ports:
       - "8082:8082"
       - "7002:7001"
@@ -62,6 +68,9 @@ services:
       HTTP_ADDR: ":8083"
       PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
       DATA_DIR: /data
+      ELECTION_TIMEOUT_MIN_MS: 500
+      ELECTION_TIMEOUT_MAX_MS: 1000
+      HEARTBEAT_INTERVAL_MS: 100
     ports:
       - "8083:8083"
       - "7003:7001"
@@ -82,6 +91,9 @@ services:
       HTTP_ADDR: ":8084"
       PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083,node4=localhost:8084"
       DATA_DIR: /data
+      ELECTION_TIMEOUT_MIN_MS: 500
+      ELECTION_TIMEOUT_MAX_MS: 1000
+      HEARTBEAT_INTERVAL_MS: 100
     ports:
       - "8084:8084"
       - "7004:7001"

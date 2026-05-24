@@ -59,6 +59,7 @@ func (n *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapsh
 		return reply
 	}
 
+	n.leaderID = args.LeaderID
 	n.notifyHeartbeat()
 
 	// Already have this snapshot or a newer one — nothing to do.
@@ -102,7 +103,7 @@ func (n *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapsh
 // Runs in its own goroutine. term is the leader term at dispatch time.
 func (n *RaftNode) sendSnapshotToPeer(peer string, term uint64, args InstallSnapshotArgs) {
 	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(n.config.HeartbeatIntervalMs)*time.Millisecond)
+		10*time.Duration(n.config.HeartbeatIntervalMs)*time.Millisecond)
 	defer cancel()
 
 	reply, err := n.transport.InstallSnapshot(ctx, peer, args)

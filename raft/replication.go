@@ -53,7 +53,9 @@ func (n *RaftNode) buildArgsLocked(peer string) AppendEntriesArgs {
 	nextIdx := n.nextIndex[peer]
 	prevIdx := nextIdx - 1
 	prevTerm := n.log.get(prevIdx).Term
-	entries := n.log.slice(nextIdx, n.log.lastIndex()+1)
+	raw := n.log.slice(nextIdx, n.log.lastIndex()+1)
+	entries := make([]LogEntry, len(raw))
+	copy(entries, raw)
 	return AppendEntriesArgs{
 		Term:         n.currentTerm,
 		LeaderID:     n.id,

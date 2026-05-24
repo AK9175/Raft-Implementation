@@ -551,145 +551,647 @@ node.AddPeer("node4:7001")
 
 ### Use Case 1 — Normal Write (PUT)
 
+**Scenario:** Client writes `name=alice` to a follower node.
+
 ```
-┌────────┐  PUT /keys/x?value=hello   ┌──────────┐
-│ Client │ ─────────────────────────► │  node2   │
-└────────┘                            │(follower)│
-    ▲                                 └────┬─────┘
-    │           302 → leader               │
-    │ ◄────────────────────────────────────┘
+┌────────┐  PUT /keys/name?value=alice   ┌──────────┐
+│ Client │ ────────────────────────────► │  node2   │
+└────────┘                               │(follower)│
+    ▲                                    └────┬─────┘
+    │        302 → leader (node1)             │
+    │ ◄───────────────────────────────────────┘
     │
-    │  PUT /keys/x?value=hello (follows redirect)
-    └──────────────────────────────► ┌──────────┐
-                                     │  node1   │
-                                     │ (leader) │
-                                     └────┬─────┘
-                                          │ AppendEntries
-                                    ┌─────┴──────┐
-                                    ▼            ▼
-                               ┌────────┐   ┌────────┐
-                               │ node2  │   │ node3  │
-                               └────┬───┘   └────┬───┘
-                                    │ ack         │ ack
-                                    └──────┬──────┘
-                                           │ majority
-                                           ▼
-                                    commit + apply
-                                    200 OK → client
+    │  PUT /keys/name?value=alice (follows redirect)
+    └───────────────────────────────► ┌──────────┐
+                                      │  node1   │
+                                      │ (leader) │
+                                      └────┬─────┘
+                                           │ AppendEntries (parallel)
+                                     ┌─────┴──────┐
+                                     ▼            ▼
+                                ┌────────┐   ┌────────┐
+                                │ node2  │   │ node3  │
+                                └────┬───┘   └────┬───┘
+                                     │ ack         │ ack
+                                     └──────┬──────┘
+                                            │ majority reached
+                                            ▼
+                                     commit + apply
+                                     200 OK → client
 ```
+
+**Step-by-step:**
+
+```
+Step 1 — Client hits node2 (a follower)
+  node2: r.Method == PUT and state != Leader
+  node2: 302 redirect → http://localhost:8081/keys/name?value=alice
+
+Step 2 — Client follows redirect to node1 (leader)
+  node1: store.Set("name", "alice")
+  node1: encodes command → node.Submit(bytes)
+
+Step 3 — Leader appends to its OWN log first (does not wait for followers)
+  node1 log: [..., entry{term:1, index:5, cmd:"SET name alice"}]
+  node1: persist() → write raft-state.bin.tmp → fsync → rename
+  node1: commitIndex stays at 4 (not committed yet)
+
+Step 4 — Leader sends AppendEntries to ALL followers in parallel
+  node1 → node2: AppendEntries{PrevLogIndex:4, Entries:[entry5], LeaderCommit:4}
+  node1 → node3: AppendEntries{PrevLogIndex:4, Entries:[entry5], LeaderCommit:4}
+  node1 → node4: AppendEntries{PrevLogIndex:4, Entries:[entry5], LeaderCommit:4}
+
+Step 5 — Each follower validates and appends
+  follower checks: do I have an entry at PrevLogIndex(4) with matching term?
+  YES → append entry5 to local log → persist → reply Success
+
+Step 6 — Leader counts acknowledgements (majority check)
+  node1 gets Success from node2: matchIndex[node2]=5
+  node1 gets Success from node3: matchIndex[node3]=5
+  maybeCommit: quorum of {node1=5, node2=5, node3=5, node4=?} → quorumIdx=5
+  entry5.Term(1) == currentTerm(1) → commitIndex = 5
+
+Step 7 — Leader applies to state machine
+  applyLoop: stateMachine.Apply("SET name alice") → kv.data["name"]="alice"
+  applyCh ← ApplyMsg{Index:5, ...}
+  kvstore routes result → HTTP 200 OK → client
+
+Step 8 — Followers learn commit on next heartbeat
+  node1 → all: AppendEntries{LeaderCommit:5}
+  followers: commitIndex = 5 → applyLoop → kv.data["name"]="alice"
+
+Key points:
+  - Leader writes locally FIRST, then replicates
+  - Client gets OK after majority (not all) nodes have the entry
+  - Followers apply slightly after — reads can be ~1 heartbeat stale
+  - If leader crashes after step 6, entry is safe (majority have it)
+```
+
+---
 
 ### Use Case 2 — Read (GET) from Any Node
 
-```
-┌────────┐  GET /keys/x   ┌──────────────────────────┐
-│ Client │ ─────────────► │ any node  (no redirect)   │
-└────────┘                │ kv.data["x"] → hello      │
-    ▲                     └──────────────────────────┘
-    │     200 OK: hello
-    └──────────────────
-
-  No leader contact. Served from local state machine.
-  Trade-off: may be up to one heartbeat (~50ms) stale.
-```
-
-### Use Case 3 — Leader Failure
+**Scenario:** Client reads `name` from a follower node.
 
 ```
-  node1 (leader) crashes
-         │
-  node2, node3 stop receiving heartbeats
-         │
-  election timers fire (random 150–300ms)
-  node2 fires first → becomeCandidate (term++)
-         │
-  RequestVote ──► node3 (granted)
-  votes = 2 >= majority = 2
-         │
-  node2 → becomeLeader
-  cluster resumes — no data loss
-         │
-  node1 restarts later:
-  ├─ loadState() → restore term from disk
-  ├─ receives heartbeat from node2 (higher term)
-  ├─ becomeFollower, catch up via AppendEntries
-  └─ rejoins as follower
+┌────────┐  GET /keys/name   ┌───────────────────────────┐
+│ Client │ ────────────────► │ node3 (follower)           │
+└────────┘                   │ kv.mu.RLock()              │
+    ▲                        │ return kv.data["name"]     │
+    │   200 OK: alice        └───────────────────────────┘
+    └────────────────
 ```
 
-### Use Case 4 — Node Restart / Crash Recovery
+**Step-by-step:**
 
 ```
-  node3 crashes
-  node1, node2 continue (still majority, writes accepted)
-         │
-  node3 restarts
-         │
-  loadState()       → term, votedFor, log restored from .bin
-  restoreSnapshot() → KVStore map rebuilt
-  applyLoop()       → replay entries up to commitIndex
-         │
-  leader sends missing entries via AppendEntries
-         │
-  node3 fully caught up, rejoins as follower
-  no manual intervention required
+Step 1 — Client hits any node (doesn't matter which)
+  node3: r.Method == GET → serve locally, no redirect
+
+Step 2 — KVStore local read
+  store.Get("name")
+  kv.mu.RLock()           ← shared read lock
+  val = kv.data["name"]   ← direct map lookup, no Raft involved
+  kv.mu.RUnlock()
+  return "alice"
+
+Step 3 — Response to client
+  HTTP 200 OK: "alice"
+
+Key points:
+  - Reads NEVER go through Raft log — instant, no network hop to leader
+  - Trade-off: may return data up to 1 heartbeat (100ms) stale
+  - Example: leader committed a new value but follower's applyLoop
+    hasn't applied it yet — follower returns the old value
+  - This is called "stale read" — acceptable in most use cases
+  - For strict consistency, reads must go to leader (not implemented here)
 ```
+
+---
+
+### Use Case 3 — Leader Election
+
+**Scenario:** The current leader crashes; the cluster elects a new one.
+
+```
+  node1 (leader, term 1) — CRASHES
+         │
+  node2, node3, node4 stop receiving heartbeats
+         │
+  each node's election timer counts down (500–1000ms random)
+  node3 fires first
+         │
+  node3: becomeCandidate()        node2: still counting down
+  term++ → term=2                 node4: still counting down
+  votedFor = "node3"
+  persist()
+         │
+  node3 → RequestVote(term=2) ──► node2 (votes YES)
+  node3 → RequestVote(term=2) ──► node4 (votes YES)
+         │
+  votes = 3 (self + node2 + node4) >= majority(2 of 3) = 2
+         │
+  node3: becomeLeader()
+  nextIndex[node2]=lastIndex+1, nextIndex[node4]=lastIndex+1
+  matchIndex[*]=0
+         │
+  node3 → heartbeat ──► node2, node4
+  node2, node4: reset election timers, leaderID="node3"
+```
+
+**Step-by-step:**
+
+```
+Step 1 — Heartbeat timeout
+  node1 was sending heartbeats every 100ms
+  node1 crashes → no more heartbeats
+  node3's election timer reaches 0 (fired at ~600ms)
+
+Step 2 — node3 becomes Candidate
+  n.state = Candidate
+  n.currentTerm++ (1 → 2)
+  n.votedFor = "node3"
+  persist() → term and vote written to disk (crash-safe)
+
+Step 3 — node3 sends RequestVote to all peers in parallel
+  RequestVoteArgs{Term:2, CandidateID:"node3",
+                  LastLogIndex:4, LastLogTerm:1}
+
+Step 4 — Each peer decides whether to vote
+  Voter checks TWO conditions:
+    a) Has it already voted in term 2? NO → can vote
+    b) Is node3's log at least as up-to-date?
+       node3.LastLogTerm(1) vs voter.lastTerm(1) → equal
+       node3.LastLogIndex(4) vs voter.lastIndex(4) → equal
+       → UP-TO-DATE → grant vote
+
+Step 5 — node3 counts votes
+  node3 gets vote from node2: votes=2
+  node3 gets vote from node4: votes=3
+  votes(3) >= majority(2) → becomeLeader()
+
+Step 6 — node3 becomes Leader
+  n.state = Leader
+  n.leaderID = "node3"
+  Initialize: nextIndex[node2]=5, nextIndex[node4]=5
+              matchIndex[node2]=0, matchIndex[node4]=0
+
+Step 7 — node3 sends first heartbeat
+  node2, node4 receive AppendEntries{Term:2, LeaderID:"node3"}
+  → reset election timers → leaderID = "node3"
+
+Key points:
+  - Randomized timeouts (500–1000ms) ensure only ONE node fires first
+  - Two conditions for vote: haven't voted + log is up-to-date
+  - Log up-to-date check prevents a stale node from becoming leader
+  - Higher last term wins outright; equal terms use log length
+  - node1 eventually restarts: sees term=2 > its term=1 → becomes follower
+```
+
+---
+
+### Use Case 4 — Follower Crash and Recovery
+
+**Scenario:** node3 crashes while cluster is running; writes happen during downtime; node3 restarts.
+
+```
+  node3 crashes (docker stop / power cut)
+         │
+  node1 (leader) keeps replicating to node2, node4
+  writes during downtime: SET a=1, SET b=2, SET c=3
+         │
+  node3 restarts (docker start)
+         │
+  Run() begins:
+  loadState()         restore term, votedFor, log from disk
+  restoreSnapshot()   rebuild KVStore from last snapshot (if any)
+  go applyLoop()      ready to apply committed entries
+         │
+  node1 sends heartbeat to node3:
+  AppendEntries{PrevLogIndex:7, PrevLogTerm:1, LeaderCommit:7}
+         │
+  node3 log consistency check:
+  "do I have index 7?" → NO → ConflictIndex = lastIndex+1
+         │
+  node1: backs up nextIndex[node3] → resends from index 5
+  node3: appends entries 5,6,7 → replies Success
+         │
+  node3: commitIndex=7 → applyLoop applies entries 5,6,7
+  kv.data["a"]="1", kv.data["b"]="2", kv.data["c"]="3"
+         │
+  node3 fully recovered, all data present
+```
+
+**Step-by-step:**
+
+```
+Step 1 — node3 crashes
+  raft-state.bin on disk: term=1, log=[1..4] (last checkpoint)
+  raft-snapshot.bin: snapshot@3 (if taken)
+  volatile state (commitIndex, peers) lost
+
+Step 2 — Cluster continues without node3
+  node1+node2 = 2 out of 3 = majority → writes still accepted
+  entries 5,6,7 committed on node1+node2
+
+Step 3 — node3 restarts
+  loadState(): read raft-state.bin
+    currentTerm=1, votedFor="", log=[1..4]
+  restoreSnapshot(): read raft-snapshot.bin
+    rebuild kv.data from snapshot
+    lastApplied=3, commitIndex=3
+  go applyLoop(): background loop started, waits for commitNotify
+
+Step 4 — node3 receives first heartbeat from leader (node1)
+  AppendEntries{Term:1, PrevLogIndex:4, Entries:[5,6,7], LeaderCommit:7}
+  Log consistency check: log.get(4).Term == 1 → matches
+  Append entries 5,6,7 to local log
+  commitIndex = min(LeaderCommit=7, lastIndex=7) = 7
+  notifyCommit()
+
+Step 5 — applyLoop catches up
+  lastApplied=3, commitIndex=7
+  Apply entry 4 → kv.data updated
+  Apply entry 5 → kv.data["a"]="1"
+  Apply entry 6 → kv.data["b"]="2"
+  Apply entry 7 → kv.data["c"]="3"
+
+Step 6 — node3 fully recovered
+  state=follower, leader="node1", commitIndex=7, lastApplied=7
+  No manual intervention needed
+  All data present — nothing lost
+
+Key points:
+  - Disk persistence (raft-state.bin) survives crashes
+  - On restart, volatile state is 0/nil; only persisted state restored
+  - Leader sends missing entries on first heartbeat
+  - If node3 missed 1000+ entries, leader may send snapshot instead
+    (InstallSnapshot RPC) to avoid replaying the full log
+```
+
+---
 
 ### Use Case 5 — Snapshot and Log Compaction
 
+**Scenario:** After 100 entries applied, the KVStore takes a snapshot to reclaim disk space.
+
 ```
-  100 entries applied
-         │
-  kv.Snapshot() → serialize map → bytes
+  log: [1][2][3]...[98][99][100][101][102]
+       ↑                    ↑
+       old entries       lastApplied=100
+
+  kv.Snapshot() → gob.Encode(kv.data) → []byte{...}
   node.TakeSnapshot(bytes)
-  ├─ write raft-snapshot.bin (atomic)
-  └─ log.compactTo(100) → discard entries 1–100
 
-  Before: [1][2][3]...[100][101][102]
-  After:  [snap@100][101][102]
-         │
-  new node joins, needs entry 50 (compacted):
-  leader → InstallSnapshot (full state at 100)
-  new node: restore snapshot → receive 101, 102
+  log: [snap@100][101][102]
+        ↑ sentinel
+        (entries 1–100 discarded from memory and disk)
 ```
 
-### Use Case 6 — Adding a Node Live
+**Step-by-step:**
+
+```
+Step 1 — Application decides to snapshot
+  kvstore: if len(applied) >= snapshotThreshold(100)
+  kv.Snapshot() → gob.Encode(kv.data) → snapshot bytes
+
+Step 2 — Raft compacts the log
+  node.TakeSnapshot(data):
+    index = lastApplied = 100
+    term  = log.get(100).Term
+    saveSnapshot(index, term, data)  ← atomic write to raft-snapshot.bin
+    snapshotData = data
+    log.compactTo(100, term)
+      entries[0] = {Index:100, Term:1}  ← new sentinel
+      entries 1–100 discarded (GC'd)
+    persist()  ← raft-state.bin updated (log now starts at sentinel)
+
+Step 3 — A new follower joins and needs entry 50 (compacted)
+  leader: nextIndex[newNode] = 51 (backed up during consistency check)
+  leader: nextIndex[newNode](51) <= snapshotIndex(100)
+  → send InstallSnapshot instead of AppendEntries
+  InstallSnapshotArgs{LastIncludedIndex:100, LastIncludedTerm:1, Data:bytes}
+
+Step 4 — Follower installs snapshot
+  HandleInstallSnapshot:
+    log.compactTo(100, 1)   ← fast-forward log to snapshot boundary
+    lastApplied = 100
+    commitIndex = 100
+    snapshotNotifyC ← snap  ← signal applyLoop to restore
+
+Step 5 — applyLoop restores state machine
+  stateMachine.Restore(data) → rebuild kv.data from snapshot bytes
+  follower now has full state at index 100
+  leader resumes AppendEntries from index 101
+
+Key points:
+  - Application drives when to snapshot (it knows when state is consistent)
+  - Raft controls which index to compact to (lastApplied)
+  - Atomic write pattern: tmp → fsync → rename (crash-safe)
+  - InstallSnapshot is used when log entries are compacted away
+  - After snapshot, new nodes catch up in one RPC instead of replaying log
+```
+
+---
+
+### Use Case 6 — Adding a Node Live (Dynamic Membership)
+
+**Scenario:** Add node4 to a running 3-node cluster without stopping it.
 
 ```
   3-node cluster: node1(leader), node2, node3
+  Quorum = 2 of 3
+
          │
   docker compose up node4 -d
+  node4 starts with RAFT_PEERS="" → no elections (empty-peers guard)
+         │
   POST /admin/add-node {"addr":"node4:7001"}
          │
-  leader appends config entry (index N)
-  leader adds node4 to peers immediately → replication starts
+  node1: submitConfigLocked("add", "node4:7001")
+  node1: peers = [node2, node3, node4]  ← immediate (before commit)
+  node1: nextIndex[node4]=lastIndex+1
+         │
+  node1 → AppendEntries ──► node2, node3, node4 (config entry + backfill)
          │
   node4 catches up from index 1
+  (or via InstallSnapshot if log compacted)
          │
-  config entry commits (node1+node2+node3 = majority of 4)
+  majority acks (node1+node2+node3 = 3) → config entry commits
          │
-  applyConfigEntry on node2, node3 → add node4 to their peers
+  applyConfigEntry on each node:
+    node2, node3: add "node4:7001" to n.peers
+    node4: skip (own SelfAddr)
          │
-  4-node cluster, new quorum = 3 of 4
+  4-node cluster: quorum = 3 of 4
 ```
 
-### Use Case 7 — Removing a Node Safely
+**Step-by-step:**
+
+```
+Step 1 — Start node4 container
+  node4 starts with RAFT_PEERS="" → len(peers)=0
+  Empty-peers guard: election timer fires but no election started
+  node4 waits silently
+
+Step 2 — Leader receives add-node request
+  POST /admin/add-node {"addr":"node4:7001"} → node1 (leader)
+  node1.AddPeer("node4:7001"):
+    append LogEntry{IsConfig:true, ConfigOp:"add", ConfigPeer:"node4:7001"}
+    persist()
+    n.peers = append(n.peers, "node4:7001")  ← add IMMEDIATELY
+    nextIndex["node4:7001"] = lastIndex+1
+    matchIndex["node4:7001"] = 0
+    trigger replication to ALL peers including node4
+
+Step 3 — node4 receives first AppendEntries
+  node4 has empty log → fails consistency check
+  ConflictIndex = 1 (log too short)
+  leader backs up: nextIndex[node4] = 1
+  leader resends ALL entries from index 1
+
+Step 4 — node4 catches up
+  node4 appends all entries 1..N including the add-node config entry
+  node4 applies the config entry: ConfigPeer("node4:7001") == SelfAddr → skip
+
+Step 5 — Config entry commits
+  node1+node2+node3 acknowledge → majority of new 4-node cluster
+  commitIndex advances past config entry
+  applyLoop on node2, node3: applyConfigEntry("add","node4:7001")
+    → n.peers = append(n.peers, "node4:7001")
+
+Step 6 — 4-node cluster fully operational
+  All nodes: peers = [node1, node2, node3, node4]
+  Leader now needs 3 of 4 for quorum (was 2 of 3)
+
+Key points:
+  - Leader adds node4 to peers BEFORE commit so replication starts early
+  - Single-server change: only one node added at a time — safe because
+    any two majorities (old 2-of-3 and new 3-of-4) overlap by 1 node
+  - node4 can catch up via log replay or InstallSnapshot
+  - Quorum increases from 2→3 as soon as node4 is in peers
+```
+
+---
+
+### Use Case 7 — Removing a Follower Safely
+
+**Scenario:** Permanently remove node3 (a follower) from the cluster.
 
 ```
   4-node cluster: node1(leader), node2, node3, node4
+  Quorum = 3 of 4
          │
-  Step 1: docker compose stop node3
-  node3 gone, remaining 3 still majority
+  Step 1: docker stop node3   ← container stopped (optional but safe)
          │
-  Step 2: POST /admin/remove-node {"addr":"node3:7001"}
+  POST /admin/remove-node {"addr":"node3:7001"}
          │
-  leader appends config entry (remove node3)
-  commits on node1 + node2 + node4
+  node1: submitConfigLocked("remove", "node3:7001")
+  config entry replicated and committed on node1+node2+node4
          │
-  applyConfigEntry on all:
-  → delete "node3:7001" from peers
-  → delete nextIndex/matchIndex for node3
+  applyConfigEntry on each node:
+    node1, node2, node4: remove "node3:7001" from n.peers
+    node3 (if running): ConfigPeer==SelfAddr → clear all peers → stop elections
          │
   3-node cluster: node1, node2, node4
-  new quorum = 2 of 3
+  Quorum = 2 of 3
+```
+
+**Step-by-step:**
+
+```
+Step 1 — (Optional) Stop node3 container
+  docker stop node3
+  node1 tries heartbeats to node3 → timeout → retry next tick
+  node1+node2+node4 = 3 of 4 → still majority → writes continue
+
+Step 2 — Submit remove-node to leader
+  POST /admin/remove-node {"addr":"node3:7001"}
+  node1.RemovePeer("node3:7001"):
+    "node3:7001" found in n.peers → submitConfigLocked("remove","node3:7001")
+    append LogEntry{IsConfig:true, ConfigOp:"remove", ConfigPeer:"node3:7001"}
+    persist()
+    trigger replication (node3 still in peers for now, keeps receiving)
+
+Step 3 — Config entry replicates and commits
+  node1+node2+node4 acknowledge → 3 of 4 = majority → commit
+
+Step 4 — applyConfigEntry on each node
+  node1: remove "node3:7001" from n.peers, delete nextIndex/matchIndex
+  node2: same
+  node4: same
+  node3 (if running): ConfigPeer("node3:7001") == SelfAddr
+    → n.peers = nil
+    → nextIndex/matchIndex cleared
+    → node3 now isolated: empty peers, no elections, no disruption
+
+Step 5 — 3-node cluster
+  peers = [node1, node2, node4], quorum = 2 of 3
+  node3 is silent (no peers to start elections with)
+
+Key points:
+  - Config entry is replicated to node3 too (while it's still in peers)
+  - node3 applies "remove self" → clears peers → empty-peers guard silences it
+  - Clean removal: no disruption to cluster during or after
+  - If you restart node3 later, it will still be silent (peers=nil in memory)
+    but on restart, RAFT_PEERS env var restores peers → need add-node again
+```
+
+---
+
+### Use Case 8 — Removing the Leader (Special Case)
+
+**Scenario:** node1 IS the leader. Client calls remove-node for node1.
+
+```
+  node1 (leader), node2, node3, node4
+         │
+  POST /admin/remove-node {"addr":"node1:7001"}
+  → node1 (leader) receives it directly
+         │
+  Step 1: node1 submits config entry for own removal
+  (special case: self is never in n.peers, checked via SelfAddr)
+         │
+  Step 2: config entry replicates to node2, node3, node4
+  majority (node1 + node2 + node3) acks → commit
+         │
+  Step 3: applyConfigEntry on node1
+  ConfigPeer == SelfAddr:
+    n.peers = nil
+    n.state = Follower   ← STEP DOWN
+    n.leaderID = ""
+    heartbeats stop going out
+         │
+  Step 4: node2, node3, node4 election timers fire (500–1000ms)
+  new leader elected among them
+         │
+  LIMITATION: The remove-node entry (index N) was committed by node1
+  but node1 stepped down before sending LeaderCommit=N to followers.
+  New leader has the entry in its log but can't commit it until
+  it commits a NEW entry in its own term (Raft §5.4.2).
+         │
+  Step 5: Do ANY write → new leader commits term-2 entry
+  entry N (remove-node) cascades through → applied on new leader
+  node1 removed from all peers permanently
+```
+
+**Step-by-step:**
+
+```
+Step 1 — remove-node submitted to leader (self)
+  RemovePeer("node1:7001"):
+    rpcAddr == n.config.SelfAddr → special path (not in n.peers)
+    → submitConfigLocked("remove","node1:7001") → append config entry
+
+Step 2 — Config entry commits
+  node2, node3, node4 acknowledge → majority with node1 = commit
+  node1's applyLoop applies the entry
+
+Step 3 — node1 steps down immediately
+  applyConfigEntry: ConfigPeer=="node1:7001" == SelfAddr
+    n.peers = nil
+    n.state = Follower
+    n.leaderID = ""
+  heartbeatTicker.C fires: n.state != Leader → sendHeartbeats skipped
+  No more heartbeats reach node2, node3, node4
+
+Step 4 — New election
+  node2/3/4 election timers fire after 500–1000ms
+  one wins, becomes new leader (term+1)
+
+Step 5 — The cascading commit problem
+  New leader (say node3) has the remove entry in its log at index N
+  but commitIndex=N-1 (never learned from node1 that N was committed)
+  Raft §5.4.2: cannot commit previous-term entries by replica counting
+  → stuck until a new same-term entry commits
+
+Step 6 — Trigger resolution
+  Submit any write → new leader appends entry at index N+1, term=2
+  majority acks → commitIndex = N+1
+  applyLoop: applies entry N (remove-node) then N+1 (the write)
+  node1 removed from node3's peers → heartbeats to node1 stop
+
+Key points:
+  - The "cascading commit" delay is unique to leader self-removal
+  - For follower removal, leader sends LeaderCommit immediately → clean
+  - Production fix: no-op entry appended right after becoming leader
+    (automatically commits all previous-term entries)
+  - Alternative: leader transfer (hand off leadership before removing self)
+  - In THIS implementation: just do any write after remove-node to resolve
+```
+
+---
+
+### Use Case 9 — Network Partition (Split Brain Prevention)
+
+**Scenario:** Network splits into {node1, node2} and {node3, node4}. node1 is leader.
+
+```
+  Before partition:
+  node1(leader) ←──► node2
+       │                │
+       ▼                ▼
+  node3 ◄─────────► node4
+
+  PARTITION:
+  Side A: node1(leader), node2   ← minority (2 of 4)
+  Side B: node3, node4           ← minority (2 of 4)
+         │
+  Side A: node1 tries to commit writes
+  node1 + node2 = 2 of 4 → NOT majority → writes BLOCKED
+         │
+  Side B: node3 or node4 election timer fires
+  RequestVote → only gets 2 votes (self + 1) → NOT majority → no leader
+         │
+  BOTH sides are blocked — no split brain
+         │
+  Partition heals:
+  node1+node2+node3+node4 reconnected
+  One leader elected, cluster resumes
+```
+
+**Step-by-step:**
+
+```
+Step 1 — Partition occurs
+  Side A (node1, node2): can talk to each other
+  Side B (node3, node4): can talk to each other
+  No cross-partition communication
+
+Step 2 — Side A (node1 as leader) tries to commit
+  node1: append entry → send AppendEntries to node2, node3, node4
+  node2 replies → matchIndex[node2]=N
+  node3, node4 → timeout (unreachable)
+  maybeCommit: quorum needs 3 of 4
+    {node1=N, node2=N, node3=0, node4=0} → quorumIdx=0
+    0 > commitIndex? NO → write STALLED
+  Client gets no response (timeout)
+
+Step 3 — Side B tries to elect a leader
+  node3's election timer fires → becomeCandidate(term=2)
+  RequestVote → node4 only → 2 votes of 4 → NOT majority
+  node3 can't win → back to follower at higher term
+  Same for node4
+
+Step 4 — Both sides deadlocked
+  No writes on Side A (can't reach majority)
+  No leader on Side B (can't reach majority)
+  This is CORRECT behavior — better to stop than to diverge
+
+Step 5 — Partition heals
+  node1, node2 regain connectivity to node3, node4
+  node3/node4 have term=2 (from failed elections)
+  node1 receives message with term=2 → becomeFollower(term=2)
+  Election happens → one leader elected at term=2 or higher
+  Cluster resumes, all nodes converge on same log
+
+Key points:
+  - Majority quorum PREVENTS split brain: 2 minority groups can't both commit
+  - 4-node cluster needs 3 for quorum — one partition of 2 can never proceed
+  - 3-node cluster needs 2 for quorum — one partition of 2 CAN proceed
+    (safe because only one side of 2-1 has majority)
+  - A node in the minority simply stalls — it doesn't corrupt state
+  - When partition heals, higher-term messages automatically reconcile state
 ```
 
 ---
@@ -795,6 +1297,34 @@ curl -L -X POST http://localhost:8081/admin/remove-node \
      -d '{"addr":"node3:7001"}'
 ```
 
+**Temporary stop vs permanent removal — critical distinction:**
+
+Docker manages containers. The admin API manages cluster membership. They are independent layers.
+
+| Intent | Docker | Admin API | Bring back |
+|---|---|---|---|
+| Temporary maintenance | `docker stop node3` | do NOT call remove-node | `docker start node3` — rejoins automatically |
+| Permanent removal | `docker stop node3` | call `remove-node` | `docker start node3` + call `add-node` |
+
+```
+WRONG — starts container after remove-node without add-node:
+  docker stop node3
+  POST /admin/remove-node          ← node3 removed from cluster peers
+  docker start node3               ← node3 gets no heartbeats, starts elections
+                                      → disrupts cluster with high-term RPCs
+
+RIGHT — temporary stop (no membership change):
+  docker stop node3                ← still in peers, leader keeps trying to replicate
+  docker start node3               ← receives heartbeat, rejoins as follower automatically
+
+RIGHT — permanent removal then re-add:
+  docker stop node3
+  POST /admin/remove-node          ← officially removed from cluster
+  docker start node3               ← container running but not in cluster
+  POST /admin/add-node             ← officially re-added, leader starts heartbeats
+                                      node3 receives heartbeat, becomes follower
+```
+
 **Simulate leader failure:**
 ```bash
 # Find leader
@@ -816,6 +1346,254 @@ docker compose -f infra/docker-compose.yml start node1
 **Full teardown:**
 ```bash
 docker compose -f infra/docker-compose.yml down -v --rmi all
+```
+
+---
+
+## Testing
+
+A complete set of scenarios to verify every feature of the cluster.
+
+---
+
+### Test 1 — Basic CRUD
+
+```bash
+# Write to any node (redirects to leader automatically)
+curl -L -X PUT "http://localhost:8081/keys/name?value=raft"
+curl -L -X PUT "http://localhost:8082/keys/version?value=1.0"
+curl -L -X PUT "http://localhost:8083/keys/status?value=running"
+
+# Read from any node (served locally, no redirect)
+curl http://localhost:8081/keys/name
+curl http://localhost:8082/keys/version
+curl http://localhost:8083/keys/status
+
+# Delete
+curl -L -X DELETE "http://localhost:8081/keys/version"
+
+# Verify deleted
+curl http://localhost:8082/keys/version   # → 404 not found
+```
+
+---
+
+### Test 2 — Redirect Behaviour
+
+```bash
+# Write to a follower — should get 302 redirect to leader
+# Without -L: shows redirect, no data written
+curl -v -X PUT "http://localhost:8082/keys/test?value=hello" 2>&1 | grep "< HTTP"
+# → HTTP/1.1 302 Found
+
+# With -L: follows redirect, data written
+curl -L -X PUT "http://localhost:8082/keys/test?value=hello"
+# → OK
+
+# GET never redirects — always served locally
+curl -v "http://localhost:8082/keys/test" 2>&1 | grep "< HTTP"
+# → HTTP/1.1 200 OK  (no redirect)
+```
+
+---
+
+### Test 3 — Replication Across All Nodes
+
+```bash
+# Write on leader
+curl -L -X PUT "http://localhost:8081/keys/replicated?value=yes"
+
+# Read from every node — all should return the same value
+curl http://localhost:8081/keys/replicated
+curl http://localhost:8082/keys/replicated
+curl http://localhost:8083/keys/replicated
+curl http://localhost:8084/keys/replicated
+```
+
+---
+
+### Test 4 — Leader Election
+
+```bash
+# Find current leader
+curl http://localhost:8081/status | grep leader
+
+# Stop the leader (say node1)
+docker compose -f infra/docker-compose.yml stop node1
+
+# Wait ~300ms for new election, then check
+curl http://localhost:8082/status
+curl http://localhost:8083/status
+# → new leader elected, term incremented by 1
+
+# Writes still work through new leader
+curl -L -X PUT "http://localhost:8082/keys/after-election?value=cluster-alive"
+
+# Bring node1 back — rejoins as follower automatically
+docker compose -f infra/docker-compose.yml start node1
+curl http://localhost:8081/status
+# → state: follower, same leader as node2/node3
+```
+
+---
+
+### Test 5 — Data Durability After Crash
+
+```bash
+# Write before crash
+curl -L -X PUT "http://localhost:8081/keys/before-crash?value=persisted"
+
+# Stop a node
+docker compose -f infra/docker-compose.yml stop node3
+
+# Write while node3 is down
+curl -L -X PUT "http://localhost:8081/keys/during-crash?value=also-persisted"
+
+# Restart node3
+docker compose -f infra/docker-compose.yml start node3
+
+# Wait a second for catch-up
+sleep 1
+
+# Both keys should be on node3
+curl http://localhost:8083/keys/before-crash    # → persisted
+curl http://localhost:8083/keys/during-crash    # → also-persisted
+```
+
+---
+
+### Test 6 — Node Failure Does Not Lose Data
+
+```bash
+# Write to cluster
+curl -L -X PUT "http://localhost:8081/keys/durable?value=safe"
+
+# Verify all 4 nodes have it
+curl http://localhost:8081/keys/durable
+curl http://localhost:8082/keys/durable
+curl http://localhost:8083/keys/durable
+curl http://localhost:8084/keys/durable
+
+# Stop 1 node (cluster still has majority)
+docker compose -f infra/docker-compose.yml stop node4
+
+# Writes still work (3 of 4 nodes up = majority)
+curl -L -X PUT "http://localhost:8081/keys/while-down?value=still-works"
+
+# Bring node4 back
+docker compose -f infra/docker-compose.yml start node4
+sleep 1
+
+# node4 caught up — has both keys
+curl http://localhost:8084/keys/durable
+curl http://localhost:8084/keys/while-down
+```
+
+---
+
+### Test 7 — Heartbeat Monitoring
+
+```bash
+# Check heartbeat counters growing in real time
+curl http://localhost:8081/status   # leader: heartbeats_sent growing
+curl http://localhost:8082/status   # follower: heartbeats_received growing
+
+# Run twice with a gap and compare counts
+curl -s http://localhost:8081/status | grep heartbeats_sent
+sleep 5
+curl -s http://localhost:8081/status | grep heartbeats_sent
+# → should have increased by ~100 (20 heartbeats/sec × 5 sec)
+```
+
+---
+
+### Test 8 — Dynamic Membership (Add Node)
+
+```bash
+# Start with 3-node cluster (node1, node2, node3)
+# Write some data
+curl -L -X PUT "http://localhost:8081/keys/before-join?value=existed"
+
+# Start node4 container
+docker compose -f infra/docker-compose.yml up node4 -d
+
+# Add node4 to cluster
+curl -L -X POST http://localhost:8081/admin/add-node \
+     -H "Content-Type: application/json" \
+     -d '{"addr":"node4:7001"}'
+
+# Verify node4 is follower and has old data
+curl http://localhost:8084/status              # state: follower
+curl http://localhost:8084/keys/before-join    # → existed (replicated)
+
+# Write after join — node4 should get it too
+curl -L -X PUT "http://localhost:8081/keys/after-join?value=new-data"
+curl http://localhost:8084/keys/after-join     # → new-data
+```
+
+---
+
+### Test 9 — Dynamic Membership (Remove Node)
+
+```bash
+# Stop target node first
+docker compose -f infra/docker-compose.yml stop node3
+
+# Remove from cluster config
+curl -L -X POST http://localhost:8081/admin/remove-node \
+     -H "Content-Type: application/json" \
+     -d '{"addr":"node3:7001"}'
+
+# Cluster now has node1, node2, node4
+curl http://localhost:8081/status   # commit_index advanced
+curl http://localhost:8082/status
+curl http://localhost:8084/status
+
+# Writes still work (3-node cluster, quorum = 2)
+curl -L -X PUT "http://localhost:8081/keys/after-remove?value=3-nodes"
+curl http://localhost:8084/keys/after-remove   # → 3-nodes
+```
+
+---
+
+### Test 10 — Re-add a Removed Node
+
+```bash
+# After Test 9 (node3 removed), bring it back
+docker compose -f infra/docker-compose.yml up node3 -d
+
+# Add it back to cluster
+curl -L -X POST http://localhost:8081/admin/add-node \
+     -H "Content-Type: application/json" \
+     -d '{"addr":"node3:7001"}'
+
+# node3 should be follower with all data caught up
+curl http://localhost:8083/status
+curl http://localhost:8083/keys/after-remove   # → 3-nodes
+```
+
+---
+
+### Test 11 — Majority Loss (Cluster Unavailable)
+
+```bash
+# Stop 2 nodes in a 3-node cluster (loses majority)
+docker compose -f infra/docker-compose.yml stop node2
+docker compose -f infra/docker-compose.yml stop node3
+
+# Writes fail — no majority to commit
+curl -L -X PUT "http://localhost:8081/keys/no-majority?value=blocked"
+# → 503 timed out waiting for commit (after 5 seconds)
+
+# Reads still work from surviving node (local state machine)
+curl http://localhost:8081/keys/before-join    # → existed
+
+# Restore majority
+docker compose -f infra/docker-compose.yml start node2
+docker compose -f infra/docker-compose.yml start node3
+
+# Writes work again
+curl -L -X PUT "http://localhost:8081/keys/restored?value=back"
 ```
 
 ---

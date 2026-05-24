@@ -261,6 +261,10 @@ func (n *RaftNode) RemovePeer(rpcAddr string) error {
 	if n.state != Leader {
 		return ErrNotLeader
 	}
+	// Self-removal: the leader is never in its own n.peers, so check SelfAddr directly.
+	if rpcAddr == n.config.SelfAddr {
+		return n.submitConfigLocked("remove", rpcAddr)
+	}
 	found := false
 	for _, p := range n.peers {
 		if p == rpcAddr {
@@ -331,6 +335,20 @@ func (n *RaftNode) applyConfigEntry(entry LogEntry) {
 		}
 
 	case "remove":
+		if entry.ConfigPeer == n.config.SelfAddr {
+			// This node itself was removed. Clear all peers so the empty-peers
+			// election guard stops us from running elections and disrupting the cluster.
+			n.peers = nil
+			n.nextIndex = make(map[string]uint64)
+			n.matchIndex = make(map[string]uint64)
+			// Step down if we are the leader — followers will elect a new leader
+			// once our heartbeats stop arriving.
+			if n.state == Leader {
+				n.state = Follower
+				n.leaderID = ""
+			}
+			return
+		}
 		newPeers := n.peers[:0]
 		for _, p := range n.peers {
 			if p != entry.ConfigPeer {
