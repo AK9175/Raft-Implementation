@@ -164,6 +164,10 @@ func (n *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRepl
 
 	if args.Term > n.currentTerm {
 		n.becomeFollower(args.Term)
+	} else if args.Term == n.currentTerm && n.state == Candidate {
+		// Raft §5.2: a candidate that receives AppendEntries from a legitimate
+		// leader in the same term must revert to follower.
+		n.state = Follower
 	}
 
 	reply := AppendEntriesReply{Term: n.currentTerm}

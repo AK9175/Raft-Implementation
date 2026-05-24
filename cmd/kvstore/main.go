@@ -44,6 +44,14 @@ func main() {
 	peers := splitNonEmpty(os.Getenv("RAFT_PEERS"), ",")
 	peerHTTPAddrs := parsePeerHTTPAddrs(os.Getenv("PEER_HTTP_ADDRS"))
 
+	// Derive the address other nodes use to reach us for membership changes.
+	// If RAFT_RPC_ADDR is just a port (":7001"), prepend NODE_ID so we get
+	// "node1:7001" — the Docker DNS name other containers resolve.
+	selfAddr := os.Getenv("NODE_RPC_ADDR")
+	if selfAddr == "" && strings.HasPrefix(raftRPCAddr, ":") {
+		selfAddr = nodeID + raftRPCAddr
+	}
+
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", dataDir, err)
 	}
@@ -52,6 +60,7 @@ func main() {
 
 	cfg := raft.Config{
 		ID:                   nodeID,
+		SelfAddr:             selfAddr,
 		Peers:                peers,
 		Transport:            transport,
 		ElectionTimeoutMinMs: 150,
@@ -78,6 +87,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/keys/", makeHandler(store, node, peerHTTPAddrs))
 	mux.HandleFunc("/status", makeStatusHandler(nodeID, node))
+	mux.HandleFunc("/admin/add-node", makeAdminHandler(node, peerHTTPAddrs, "add"))
+	mux.HandleFunc("/admin/remove-node", makeAdminHandler(node, peerHTTPAddrs, "remove"))
 
 	log.Printf("[%s] kvstore http listening on %s", nodeID, httpAddr)
 	if err := http.ListenAndServe(httpAddr, mux); err != nil {
@@ -184,6 +195,55 @@ func splitNonEmpty(s, sep string) []string {
 		return nil
 	}
 	return strings.Split(s, sep)
+}
+
+// makeAdminHandler returns a handler for POST /admin/add-node or /admin/remove-node.
+// Redirects to the leader (307 to preserve POST) when this node is a follower.
+// Body: {"addr": "<rpc-address>"}  e.g. {"addr": "node4:7001"}
+func makeAdminHandler(node *raft.RaftNode, peerHTTPAddrs map[string]string, op string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if node.State() != raft.Leader {
+			leaderID := node.LeaderID()
+			if leaderID == "" {
+				http.Error(w, "no leader elected yet, retry shortly", http.StatusServiceUnavailable)
+				return
+			}
+			leaderAddr, ok := peerHTTPAddrs[leaderID]
+			if !ok {
+				http.Error(w, "unknown leader address", http.StatusInternalServerError)
+				return
+			}
+			// 307 preserves the POST method (unlike 302 which browsers change to GET).
+			target := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.RequestURI())
+			http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+			return
+		}
+
+		var req struct {
+			Addr string `json:"addr"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Addr == "" {
+			http.Error(w, "body must be JSON with an \"addr\" field", http.StatusBadRequest)
+			return
+		}
+
+		var err error
+		switch op {
+		case "add":
+			err = node.AddPeer(req.Addr)
+		case "remove":
+			err = node.RemovePeer(req.Addr)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "OK")
+	}
 }
 
 // parsePeerHTTPAddrs parses "node1=localhost:8081,node2=localhost:8082" into a map.

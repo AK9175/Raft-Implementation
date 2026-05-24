@@ -11,6 +11,12 @@ type LogEntry struct {
 	Term    uint64
 	Index   uint64
 	Command []byte
+
+	// Membership change fields — only populated when IsConfig is true.
+	// Raft §6: single-server changes are safe with overlapping majorities.
+	IsConfig   bool   // true for membership change entries
+	ConfigOp   string // "add" or "remove"
+	ConfigPeer string // RPC address of the peer being added or removed
 }
 
 // Log holds the replicated log for a single Raft node.

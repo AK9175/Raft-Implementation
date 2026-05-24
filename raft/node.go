@@ -64,6 +64,11 @@ type Config struct {
 	// DataDir is the directory where persistent state is written.
 	// Must exist before the node starts.
 	DataDir string
+
+	// SelfAddr is this node's own RPC address as seen by other nodes
+	// (e.g. "node1:7001"). Used to skip adding self during membership changes.
+	// Optional: if empty, the add-peer delta is applied unconditionally.
+	SelfAddr string
 }
 
 // RaftNode is a single participant in a Raft cluster.
@@ -230,6 +235,114 @@ func (n *RaftNode) Submit(command []byte) (index uint64, term uint64, err error)
 	return index, term, nil
 }
 
+// AddPeer adds rpcAddr to the cluster. Must be called on the leader.
+// Submits a config log entry (Raft §6 single-server change) and immediately
+// starts replicating to the new peer so it can catch up before the entry commits.
+func (n *RaftNode) AddPeer(rpcAddr string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state != Leader {
+		return ErrNotLeader
+	}
+	for _, p := range n.peers {
+		if p == rpcAddr {
+			return nil // already a member
+		}
+	}
+	return n.submitConfigLocked("add", rpcAddr)
+}
+
+// RemovePeer removes rpcAddr from the cluster. Must be called on the leader.
+// Keeps the peer in the local list until the config entry is committed so it
+// still receives (and acknowledges) the entry itself.
+func (n *RaftNode) RemovePeer(rpcAddr string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state != Leader {
+		return ErrNotLeader
+	}
+	found := false
+	for _, p := range n.peers {
+		if p == rpcAddr {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil // not a member
+	}
+	return n.submitConfigLocked("remove", rpcAddr)
+}
+
+// submitConfigLocked appends a single-server membership change entry and
+// triggers replication. For "add", the new peer is added to n.peers immediately
+// so replication starts before the entry commits (safe per Raft §6).
+// Must be called with n.mu held.
+func (n *RaftNode) submitConfigLocked(op, addr string) error {
+	index := n.log.lastIndex() + 1
+	term := n.currentTerm
+	n.log.append(LogEntry{
+		Term:       term,
+		Index:      index,
+		IsConfig:   true,
+		ConfigOp:   op,
+		ConfigPeer: addr,
+	})
+	n.persist()
+
+	if op == "add" {
+		// Immediately add so heartbeats and replication reach the new node.
+		n.peers = append(n.peers, addr)
+		n.nextIndex[addr] = index // send from this entry onward; snapshot catches it up if needed
+		n.matchIndex[addr] = 0
+	}
+
+	for _, peer := range n.peers {
+		if n.nextIndex[peer] <= n.log.snapshotIndex() {
+			snapArgs := n.buildSnapshotArgsLocked()
+			go n.sendSnapshotToPeer(peer, term, snapArgs)
+		} else {
+			args := n.buildArgsLocked(peer)
+			go n.sendToPeer(peer, term, args)
+		}
+	}
+	return nil
+}
+
+// applyConfigEntry updates n.peers when a committed config entry is applied.
+// Must be called with n.mu held.
+func (n *RaftNode) applyConfigEntry(entry LogEntry) {
+	switch entry.ConfigOp {
+	case "add":
+		// Leader already updated peers in submitConfigLocked; followers update here.
+		// Skip if this is our own address (self is never in n.peers).
+		if entry.ConfigPeer == n.config.SelfAddr {
+			return
+		}
+		for _, p := range n.peers {
+			if p == entry.ConfigPeer {
+				return // already present (leader path)
+			}
+		}
+		n.peers = append(n.peers, entry.ConfigPeer)
+		if n.state == Leader {
+			n.nextIndex[entry.ConfigPeer] = n.log.lastIndex() + 1
+			n.matchIndex[entry.ConfigPeer] = 0
+		}
+
+	case "remove":
+		newPeers := n.peers[:0]
+		for _, p := range n.peers {
+			if p != entry.ConfigPeer {
+				newPeers = append(newPeers, p)
+			}
+		}
+		n.peers = newPeers
+		delete(n.nextIndex, entry.ConfigPeer)
+		delete(n.matchIndex, entry.ConfigPeer)
+	}
+}
+
 // ApplyCh returns the channel on which committed log entries are delivered after
 // being applied to the state machine. Callers should read this continuously;
 // the channel is buffered but a slow reader will eventually stall the apply loop.
@@ -292,7 +405,7 @@ func (n *RaftNode) notifyCommit() {
 func (n *RaftNode) Run() {
 	defer close(n.done)
 
-	n.loadState()          // restore term, votedFor, and log entries from disk
+	n.loadState()           // restore term, votedFor, and log entries from disk
 	n.restoreFromSnapshot() // must run before applyLoop so the SM is ready before any Apply calls
 
 	go n.applyLoop() // apply committed entries to the state machine in the background
@@ -310,8 +423,10 @@ func (n *RaftNode) Run() {
 
 		case <-electionTimer.C:
 			// No heartbeat received before timeout — start an election.
+			// Skip if we have no peers: we can never win and would only
+			// accumulate a high term that disrupts the cluster on join.
 			n.mu.Lock()
-			if n.state != Leader {
+			if n.state != Leader && len(n.peers) > 0 {
 				n.becomeCandidate()
 				go n.startElection()
 			}

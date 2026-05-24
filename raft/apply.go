@@ -66,22 +66,30 @@ func (n *RaftNode) applyLoop() {
 			for n.lastApplied < n.commitIndex {
 				n.lastApplied++
 				entry := n.log.get(n.lastApplied) // copy entry under lock
-				n.mu.Unlock()
 
-				// Apply to state machine without holding the lock.
-				result := n.stateMachine.Apply(entry.Command)
+				if entry.IsConfig {
+					// Membership change — update peers under the lock; do not
+					// pass to the state machine and do not send on applyCh.
+					n.applyConfigEntry(entry)
+					n.mu.Unlock()
+				} else {
+					n.mu.Unlock()
 
-				// Deliver to the caller. Blocks if the caller is slow — the buffered
-				// channel (cap 64) absorbs short bursts.
-				select {
-				case n.applyCh <- ApplyMsg{
-					Index:   entry.Index,
-					Term:    entry.Term,
-					Command: entry.Command,
-					Result:  result,
-				}:
-				case <-n.stopCh:
-					return
+					// Apply to state machine without holding the lock.
+					result := n.stateMachine.Apply(entry.Command)
+
+					// Deliver to the caller. Blocks if the caller is slow — the buffered
+					// channel (cap 64) absorbs short bursts.
+					select {
+					case n.applyCh <- ApplyMsg{
+						Index:   entry.Index,
+						Term:    entry.Term,
+						Command: entry.Command,
+						Result:  result,
+					}:
+					case <-n.stopCh:
+						return
+					}
 				}
 
 				n.mu.Lock()
