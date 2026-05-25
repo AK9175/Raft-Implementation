@@ -200,6 +200,33 @@ func (n *RaftNode) LastApplied() uint64 {
 	return n.lastApplied
 }
 
+// Peers returns a snapshot of the current peer list. Safe to call concurrently.
+func (n *RaftNode) Peers() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]string, len(n.peers))
+	copy(out, n.peers)
+	return out
+}
+
+// LogEntries returns a copy of the current in-memory log entries (after the
+// snapshot boundary). Intended for observability only — do not mutate.
+func (n *RaftNode) LogEntries() []LogEntry {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	raw := n.log.slice(n.log.snapshotIndex()+1, n.log.lastIndex()+1)
+	out := make([]LogEntry, len(raw))
+	copy(out, raw)
+	return out
+}
+
+// SnapshotIndex returns the index of the last compacted snapshot boundary.
+func (n *RaftNode) SnapshotIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.log.snapshotIndex()
+}
+
 // Stop signals the node to shut down and waits for it to finish.
 func (n *RaftNode) Stop() {
 	close(n.stopCh)

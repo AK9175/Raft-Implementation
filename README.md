@@ -1,6 +1,6 @@
 # Raft Consensus — Distributed KV Store
 
-A complete implementation of the Raft consensus algorithm in Go, with a linearizable key-value store built on top, HTTP/JSON transport, Docker containerization, and live cluster membership changes.
+A complete implementation of the Raft consensus algorithm in Go, with a linearizable key-value store built on top, gRPC/protobuf transport for inter-node RPCs, HTTP/JSON API for clients, Docker containerization, live cluster membership changes, a sidecar process for container lifecycle management, and a real-time React dashboard for cluster visualization and control.
 
 ---
 
@@ -12,8 +12,11 @@ A complete implementation of the Raft consensus algorithm in Go, with a lineariz
 - [The Three Guarantees](#the-three-guarantees)
 - [Real World Usage](#real-world-usage)
 - [Architecture](#architecture)
+- [Dashboard & Sidecar](#dashboard--sidecar)
+  - [Screenshots](#screenshots)
 - [Package Structure](#package-structure)
 - [Checkpoints Implemented](#checkpoints-implemented)
+- [Implementation Modifications & Fixes](#implementation-modifications--fixes)
 - [Raft Concepts and Conditions](#raft-concepts-and-conditions)
 - [Code Flow](#code-flow)
 - [Use Cases with Diagrams](#use-cases-with-diagrams)
@@ -123,22 +126,70 @@ Raft decomposes consensus into three largely independent subproblems — leader 
                         └─────────────────────────────────────┘
 
    Ports (per node):
-     :7001  Raft RPC  (AppendEntries, RequestVote, InstallSnapshot)
-     :808x  KVStore HTTP API  (GET /keys/, PUT /keys/, DELETE /keys/)
+     :7001  Raft gRPC  (AppendEntries, RequestVote, InstallSnapshot — protobuf binary)
+     :808x  KVStore HTTP API  (GET /keys/, PUT /keys/, DELETE /keys/ — JSON)
+```
+
+### Full System with Dashboard & Sidecar
+
+```
+  Browser (React Dashboard)
+       │  poll every 2 s
+       │  POST /nodes/create
+       │  POST /nodes/{id}/stop
+       ▼
+  ┌─────────────────────────────┐
+  │   cmd/sidecar  :9090        │   ← Go HTTP server, single source of truth
+  │                             │
+  │  GET /nodes ──► polls all   │
+  │               node /status  │
+  │                             │
+  │  POST /nodes/create         │
+  │   └─ docker compose up      │
+  │      docker run (custom)    │
+  │      clearNodeData()        │
+  │      raftAddNode (leader)   │
+  │                             │
+  │  POST /nodes/{id}/stop      │
+  │   └─ raftRemoveNode         │
+  │      docker compose stop    │
+  │      docker rm (custom)     │
+  └──────────┬──────────────────┘
+             │  docker API + Raft HTTP admin API
+             ▼
+  ┌──────────────────────────────────────────────┐
+  │             Docker (infra_default network)    │
+  │                                              │
+  │  infra-node1-1  :8081/:7001                  │
+  │  infra-node2-1  :8082/:7002                  │
+  │  infra-node3-1  :8083/:7003                  │
+  │  infra-node4-1  :8084/:7004   (preset, non-bootstrap)  │
+  │  infra-node5-1  :8085/:7005   (preset, non-bootstrap)  │
+  │  raft-nodeX     :888x/:700x   (custom, dynamic)        │
+  └──────────────────────────────────────────────┘
 ```
 
 ### Two Address Spaces
 
 ```
-  Inside Docker (container DNS):          Outside Docker (host machine):
-  ┌─────────────────────────┐             ┌───────────────────────────┐
-  │  node1:7001  Raft RPC   │             │  localhost:8081  HTTP API  │
-  │  node2:7001  Raft RPC   │             │  localhost:8082  HTTP API  │
-  │  node3:7001  Raft RPC   │             │  localhost:8083  HTTP API  │
-  │  node4:7001  Raft RPC   │             │  localhost:8084  HTTP API  │
-  └─────────────────────────┘             └───────────────────────────┘
-        used by Raft nodes                   used by clients (curl)
-        to replicate entries                 to read/write data
+  Inside Docker (container DNS):               Outside Docker (host machine):
+  ┌──────────────────────────────────┐         ┌───────────────────────────┐
+  │  node1:7001  Raft gRPC (proto)   │         │  localhost:8081  HTTP API  │
+  │  node2:7001  Raft gRPC (proto)   │         │  localhost:8082  HTTP API  │
+  │  node3:7001  Raft gRPC (proto)   │         │  localhost:8083  HTTP API  │
+  │  node4:7001  Raft gRPC (proto)   │         │  localhost:8084  HTTP API  │
+  │  node5:7001  Raft gRPC (proto)   │         │  localhost:8085  HTTP API  │
+  └──────────────────────────────────┘         └───────────────────────────┘
+      used by Raft nodes (binary protobuf)         used by clients (curl/JSON)
+      to replicate entries over HTTP/2             to read/write data
+
+  Sidecar:
+  ┌──────────────────────────────────┐         ┌───────────────────────────┐
+  │  localhost:808x/status  (Raft)   │◄────────│  localhost:9090  (sidecar)│
+  │  localhost:808x/admin/*          │         └───────────────────────────┘
+  └──────────────────────────────────┘
+      sidecar talks to node HTTP APIs             dashboard talks only to sidecar
+      to poll status and call admin endpoints     (no CORS issues)
 ```
 
 ### Package Dependency Diagram
@@ -157,16 +208,169 @@ Raft decomposes consensus into three largely independent subproblems — leader 
   │  Apply()        │  │  Log, Transport         │
   │  Snapshot()     │  │  Election, Replication  │
   │  Restore()      │  │  Persistence, Snapshot  │
-  └─────────────────┘  └────────────────────────┘
-         │                        │
+  └─────────────────┘  └──────────┬─────────────┘
+         │                        │  uses Transport interface
+         │               ┌────────▼───────────┐
+         │               │      proto/         │
+         │               │  raft.proto         │
+         │               │  raft.pb.go         │
+         │               │  raft_grpc.pb.go    │
+         │               │  (gRPC + protobuf)  │
+         │               └────────────────────┘
          └──────────┬─────────────┘
                     ▼
-         ┌────────────────────┐
-         │      infra/        │
-         │  Dockerfile        │
-         │  docker-compose    │
-         └────────────────────┘
+         ┌────────────────────┐    ┌──────────────────────┐
+         │      infra/        │    │    cmd/sidecar/       │
+         │  Dockerfile        │    │  main.go — Docker +  │
+         │  docker-compose    │    │  Raft admin bridge   │
+         └────────────────────┘    └──────────────────────┘
+                                            ▲
+                                            │ HTTP :9090
+                                   ┌────────────────────┐
+                                   │    dashboard/       │
+                                   │  React + TypeScript │
+                                   │  Vite dev server    │
+                                   └────────────────────┘
 ```
+
+---
+
+## Dashboard & Sidecar
+
+### Overview
+
+The project ships a browser-based dashboard for real-time cluster visualization and control. Instead of running `curl` commands manually, everything can be done from the UI.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Raft Cluster Dashboard                                          │
+│                                                                  │
+│  ┌─────────────────────────┐  ┌──────────────────────────────┐  │
+│  │   Cluster Topology      │  │   Node Details               │  │
+│  │   (SVG graph)           │  │   node1  LEADER  t5          │  │
+│  │                         │  │   node2  FOLLOWER t5         │  │
+│  │  node2 ─── node1(leader)│  │   node3  FOLLOWER t5         │  │
+│  │       \   /             │  └──────────────────────────────┘  │
+│  │        node3            │                                     │
+│  └─────────────────────────┘                                     │
+│                                                                  │
+│  ┌──────────────────────┐   ┌──────────────────────────────┐    │
+│  │  KV Store            │   │  Cluster Control             │    │
+│  │  GET  PUT  DELETE    │   │  • node1 leader  :8081  Stop │    │
+│  │  Key: [         ]    │   │  • node2 follower:8082  Stop │    │
+│  │  Value: [       ]    │   │  + Add Node                  │    │
+│  │  [ Run GET ]         │   └──────────────────────────────┘    │
+│  └──────────────────────┘                                        │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Replication Log  Source: node1 ★                        │   │
+│  │  Index  Term  Type    Command                            │   │
+│  │  10     5     SET     username = alice                   │   │
+│  │  9      5     SET     version = 2                        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Sidecar (`cmd/sidecar`)
+
+The sidecar is a lightweight Go HTTP server (`:9090`) that acts as the bridge between the browser and Docker/Raft. The browser talks only to the sidecar — never directly to node ports — which eliminates CORS restrictions entirely.
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/nodes` | Poll all known nodes concurrently, return combined Docker + Raft status |
+| `POST` | `/nodes/create` | Start a node (preset or dynamic), call add-node on the cluster leader |
+| `POST` | `/nodes/{id}/stop` | Remove from cluster, stop container, clean up |
+
+**Node types:**
+
+| Type | Definition | How started | How stopped |
+|---|---|---|---|
+| Bootstrap preset (node1–3) | In docker-compose, `RAFT_PEERS` set to peers | `docker compose up --build` | `docker compose stop` |
+| Non-bootstrap preset (node4–5) | In docker-compose, `RAFT_PEERS=""` | `docker compose up --build` + `add-node` | `remove-node` + `docker compose stop` |
+| Dynamic (custom) | Created at runtime via UI | `docker run` on `infra_default` network + `add-node` | `remove-node` + `docker stop/rm` |
+
+**`GET /nodes` response — `NodeInfo` fields:**
+
+```json
+[
+  {
+    "id":                  "node1",
+    "rpc_addr":            "node1:7001",
+    "http_port":           8081,
+    "rpc_port":            7001,
+    "bootstrap":           true,
+    "dynamic":             false,
+    "running":             true,
+    "in_cluster":          true,
+    "raft_state":          "leader",
+    "term":                5,
+    "leader":              "node1",
+    "peers":               ["node2:7001", "node3:7001"],
+    "commit_index":        42,
+    "last_applied":        42,
+    "heartbeats_sent":     1204,
+    "heartbeats_received": 0,
+    "snapshot_index":      0
+  }
+]
+```
+
+### Dashboard (`dashboard/`)
+
+React + TypeScript + Vite application. Run with:
+
+```bash
+cd dashboard
+npm install
+npm run dev   # → http://localhost:5173
+```
+
+**Components:**
+
+| Component | Description |
+|---|---|
+| `ClusterGraph` | SVG topology graph with animated leader ring and dashed heartbeat edges |
+| `NodeCard` | Per-node stats: term, leader, commit/applied index, peers, port |
+| `KVPanel` | GET/PUT/DELETE operations; GET lets you choose which node to read from |
+| `MembershipPanel` | Lists running nodes with state dot + Stop button; Add Node form |
+| `LogViewer` | Replication log table with source selector across all online nodes |
+
+**Design decisions:**
+
+- The dashboard polls `GET /nodes` every 2 seconds from a single interval in `App.tsx` — no per-component polling
+- All node status flows through the sidecar; the browser never hits `:808x` ports for status
+- `GET` reads are routed to the user-selected node (stale read by design); `PUT`/`DELETE` go to the leader
+- `LogViewer` source dropdown is built from live online nodes, not a hardcoded list
+
+### Screenshots
+
+#### Cluster Topology — 4-node cluster, node3 as leader at term 248
+
+![Dashboard — Cluster Topology](docs/screenshots/dashboard-topology.png)
+
+The topology view shows the live cluster at a glance. Each node is drawn as a circle whose color encodes its Raft role (green = leader, blue = follower, yellow = candidate). Dashed edges represent heartbeat channels from the leader to every follower. The animated ring around node3 confirms it is the current leader. The cards on the right duplicate the graph state in tabular form — term, leader ID, commit index, applied index, peer count, and HTTP port — updated on every 2-second poll.
+
+Key observations visible in this screenshot:
+- All four nodes have converged on **term 248** with **commit = applied = 6**, meaning the cluster is fully caught up.
+- **Cluster Control** (right panel) shows quorum OK with 4 nodes running and each node's Stop button for one-click removal.
+- The header bar shows `Leader: node3  term 248  4 nodes online` — a single-line cluster health summary always visible.
+
+#### KV Store Operations and Replication Log
+
+![Dashboard — KV Store and Replication Log](docs/screenshots/dashboard-kv-log.png)
+
+The lower half of the dashboard at a 4-node cluster after several operations:
+
+**KV Store panel (left):**
+- `GET name` was issued targeting **node4** (follower) directly — the result `ak` was returned locally from node4 without touching the leader. The footnote "Reading from node4 — locally served, may lag leader" makes the stale-read semantics explicit.
+- The Read From selector shows all four online nodes; the currently selected node4 is highlighted in blue. node3 (leader) is marked with a `leader` badge.
+- `PUT` and `DELETE` operations always route to the leader; the selector is hidden for those operations.
+
+**Replication Log panel (right):**
+- The source selector dropdown is open, showing all four nodes with node3 marked `★` as the leader.
+- Log entries at the bottom show the full history: index 1–6 cover an initial `CONFIG ADD node4:7001`, a `SET name=ak` write, then `CONFIG ADD` entries for node1–3 as the cluster was assembled. This is exactly what Raft appends to its log: data commands interleaved with membership change entries.
 
 ---
 
@@ -174,30 +378,52 @@ Raft decomposes consensus into three largely independent subproblems — leader 
 
 ```
 .
+├── proto/
+│   ├── raft.proto            # gRPC service + protobuf message definitions (source of truth)
+│   ├── raft.pb.go            # generated — protobuf message structs
+│   └── raft_grpc.pb.go       # generated — RaftClient + RaftServer interfaces
+│
 ├── raft/
-│   ├── node.go           # RaftNode struct, Config, Submit, AddPeer, RemovePeer
-│   ├── election.go       # becomeFollower/Candidate/Leader, startElection, HandleRequestVote
-│   ├── replication.go    # sendHeartbeats, sendToPeer, maybeCommit, HandleAppendEntries
-│   ├── apply.go          # applyLoop — applies committed entries to state machine
-│   ├── log.go            # Log struct, LogEntry, append/get/slice/compactTo
-│   ├── persist.go        # persist(), loadState() — crash-safe atomic writes to disk
-│   ├── snapshot.go       # TakeSnapshot, HandleInstallSnapshot, sendSnapshotToPeer
-│   ├── rpc.go            # RequestVoteArgs/Reply, AppendEntriesArgs/Reply, InstallSnapshotArgs
-│   ├── transport.go      # Transport interface
-│   ├── transport_http.go # HTTPTransport — JSON over HTTP, used in Docker
-│   ├── transport_memory.go # MemoryTransport — in-process, used in tests
-│   └── state_machine.go  # StateMachine interface (Apply, Snapshot, Restore)
+│   ├── node.go               # RaftNode struct, Config, Submit, AddPeer, RemovePeer, applyConfigEntry
+│   ├── election.go           # becomeFollower/Candidate/Leader, startElection, HandleRequestVote
+│   ├── replication.go        # sendHeartbeats, sendToPeer, maybeCommit, HandleAppendEntries
+│   ├── apply.go              # applyLoop — applies committed entries to state machine
+│   ├── log.go                # Log struct, LogEntry, append/get/slice/compactTo
+│   ├── persist.go            # persist(), loadState() — crash-safe atomic writes to disk
+│   ├── snapshot.go           # TakeSnapshot, HandleInstallSnapshot, sendSnapshotToPeer
+│   ├── rpc.go                # Go structs: RequestVoteArgs/Reply, AppendEntriesArgs/Reply
+│   ├── transport.go          # Transport interface (implemented by grpc and memory transports)
+│   ├── transport_grpc.go     # GRPCTransport — protobuf over HTTP/2, used in Docker
+│   ├── transport_http.go     # HTTPTransport — JSON over HTTP (legacy, kept for reference)
+│   ├── transport_memory.go   # MemoryTransport — in-process, used in tests
+│   └── state_machine.go      # StateMachine interface (Apply, Snapshot, Restore)
 │
 ├── kvstore/
-│   └── kvstore.go        # KVStore — implements StateMachine, linearizable Set/Get/Delete
+│   └── kvstore.go            # KVStore — implements StateMachine, linearizable Set/Get/Delete
 │
 ├── cmd/
-│   ├── kvstore/main.go   # binary entrypoint — wires Raft + KVStore + HTTP server
-│   └── readstate/main.go # debug tool — decodes raft-state.bin to human-readable JSON
+│   ├── kvstore/main.go       # binary entrypoint — wires Raft + KVStore + HTTP server
+│   ├── sidecar/main.go       # sidecar server :9090 — Docker lifecycle + Raft admin bridge
+│   └── readstate/main.go     # debug tool — decodes raft-state.bin to human-readable JSON
+│
+├── dashboard/
+│   ├── src/
+│   │   ├── App.tsx           # root component, 2-second poller, layout
+│   │   ├── api.ts            # fetch helpers for sidecar + node HTTP APIs
+│   │   ├── types.ts          # TypeScript interfaces: NodeStatus, LogEntry, SidecarNodeInfo
+│   │   ├── index.css         # global dark-theme design system
+│   │   └── components/
+│   │       ├── ClusterGraph.tsx    # SVG topology with gradient nodes and animated edges
+│   │       ├── NodeCard.tsx        # per-node stats card
+│   │       ├── KVPanel.tsx         # GET/PUT/DELETE UI with per-node read selector
+│   │       ├── MembershipPanel.tsx # cluster control: node list + Add Node form
+│   │       └── LogViewer.tsx       # replication log table with dynamic source selector
+│   ├── package.json
+│   └── vite.config.ts
 │
 └── infra/
-    ├── Dockerfile        # multi-stage build — Go builder + minimal alpine runtime
-    └── docker-compose.yml # 4-node cluster definition with named volumes
+    ├── Dockerfile            # multi-stage build — Go builder + minimal alpine runtime
+    └── docker-compose.yml    # 5-node cluster definition (node1–5) with named volumes
 ```
 
 ---
@@ -215,8 +441,142 @@ Raft decomposes consensus into three largely independent subproblems — leader 
 | 7 | Snapshot install — lagging follower catch-up via snapshot RPC |
 | 8 | Apply loop — committed entries applied to state machine asynchronously |
 | 9 | KVStore state machine — linearizable SET/GET/DEL over Raft log |
-| 10 | HTTP transport + Docker — real network RPC, containerized cluster |
+| 10 | gRPC/protobuf transport + Docker — binary RPC over HTTP/2, containerized cluster |
 | 11 | Dynamic membership — live add/remove nodes via config log entries |
+| 12 | Sidecar + Dashboard — container lifecycle management + real-time browser UI |
+
+---
+
+## Implementation Modifications & Fixes
+
+This section documents all changes made beyond the original checkpoint scaffolding.
+
+### Sidecar Server (`cmd/sidecar/main.go`)
+
+**Added from scratch.** The sidecar is a Go HTTP server on `:9090` that bridges the browser dashboard with Docker and the Raft admin API.
+
+**Key design decisions:**
+
+```
+Node types
+  Bootstrap (node1–3): RAFT_PEERS set → nodes self-form cluster on first start.
+                       On re-add: sidecar also calls add-node if a cluster already exists.
+  Non-bootstrap (node4–5): RAFT_PEERS="" → must be added via add-node explicitly.
+  Dynamic (custom): started via docker run on infra_default network; always uses add-node.
+```
+
+**`findOnlinePortExcluding` — leader-first routing:**
+
+Original: returned the first node that responded to `/status` — could be a follower.
+
+Problem: `POST /admin/add-node` on a follower (e.g. node4) redirects to the leader using its local `PEER_HTTP_ADDRS` map. If the leader is a dynamically-added node not present in that map, the follower returns HTTP 500 "unknown leader address".
+
+Fix: three-pass resolution:
+1. Find a node whose `/status` reports `state == "leader"` — send directly
+2. If not found, resolve the leader's HTTP port from our node registry using the follower's reported `leader` field
+3. Fall back to any online node
+
+```go
+// Pass 1: self-identified leader
+for _, r := range live {
+    if r.st.State == "leader" { return r.node.HTTPPort }
+}
+// Pass 2: resolve leader port from registry
+for _, r := range live {
+    leaderID := strings.Split(r.st.Leader, ":")[0]
+    for _, n := range all {
+        if n.ID == leaderID { return n.HTTPPort }
+    }
+}
+```
+
+**`clearNodeData` — wipe volume before restart:**
+
+Problem: `docker compose stop` leaves the container in "exited" state; the container still holds a reference to its Docker volume. A node that restarts with a high persisted term (from failed elections while isolated) sends that term to the current leader — the leader steps down immediately, triggering unnecessary re-elections and extended instability.
+
+Fix: before every `docker compose up`, force-remove the stopped container to release the volume reference, then remove the volume. `docker compose up` creates both fresh.
+
+```go
+func clearNodeData(nodeID string) {
+    // Step 1: release volume reference from stopped container
+    exec.Command("docker", "compose", "-f", composeFile, "rm", "-f", "-s", nodeID).CombinedOutput()
+    // Step 2: remove the volume (docker compose up creates a fresh one)
+    exec.Command("docker", "volume", "rm", projectName+"_"+nodeID+"-data").CombinedOutput()
+}
+```
+
+**`getBuiltImage` — two-stage image lookup:**
+
+Problem: `docker compose images -q <service>` returns empty on some Docker versions even when the image exists (built but no running containers).
+
+Fix: falls back to `docker image inspect infra-nodeX` which checks if the named image exists directly, regardless of container state.
+
+```go
+// Primary: docker compose images -q
+// Fallback: docker image inspect infra-node1 (infra-node2, ...)
+```
+
+**`startPresetNode` — bootstrap nodes join existing clusters:**
+
+Original: bootstrap nodes always relied on `RAFT_PEERS` for cluster formation. If re-added after a stop (when node2/node3 weren't running), they would enter an infinite election loop.
+
+Fix: after starting, if an active cluster exists (`findOnlinePortExcluding` returns a leader port), call `add-node` on the leader. If `add-node` fails for a bootstrap node (e.g. already a member), the error is non-fatal and logged.
+
+---
+
+### Dashboard (`dashboard/`)
+
+**Added from scratch.** React + TypeScript + Vite.
+
+**Single poller in `App.tsx`:**
+
+Original design had `MembershipPanel` polling `/nodes` independently from `App`. This caused duplicate HTTP requests every second. Fixed by lifting all polling into `App.tsx` and passing `sidecarNodes` as props to `MembershipPanel`.
+
+**`LogViewer` — dynamic source selector:**
+
+Bug: `LogViewer` used the hardcoded `KNOWN_NODES` array for the source dropdown, so dynamically-added nodes (node6, custom IDs) never appeared.
+
+Fix: source selector built from the `nodes` prop (online nodes only). Leader nodes get a ★ marker.
+
+```tsx
+// Before (bug): only showed hardcoded node1–5
+{KNOWN_NODES.map(n => <option .../>)}
+
+// After: shows all online nodes including custom ones
+{nodes.map(n => <option key={n.node_id} value={n.httpPort}>
+  {n.node_id}{n.state === 'leader' ? ' ★' : ''}
+</option>)}
+```
+
+**Port auto-fill in `AddNodeForm`:**
+
+`useEffect` clears port fields when the user switches from a preset ID (e.g. "node1") to a custom ID (e.g. "node-11"). Without this, the preset ports (8081/7001) would persist in the form.
+
+```tsx
+useEffect(() => {
+  const preset = PRESET[id.trim()];
+  setHttpPort(preset ? String(preset.httpPort) : '');
+  setRpcPort(preset  ? String(preset.rpcPort)  : '');
+}, [id]);
+```
+
+**`ClusterGraph` — SVG with radial gradients:**
+
+Nodes use SVG `<radialGradient>` definitions per state (leader/follower/candidate) for a 3D-lit appearance. Node IDs longer than 9 characters are truncated with an ellipsis to avoid overflow. Node positions are calculated dynamically based on actual online node count (not a fixed 5-node ring).
+
+**`NodeCard` — online-only, no dead code:**
+
+Cards are only rendered for online nodes. Removed the offline-state branch and port footer. Term value is colored by state (green for leader, blue for follower, amber for candidate). Snapshot row is hidden when `snapshot_index == 0`.
+
+**`KVPanel` — per-node GET selector:**
+
+GET operations let the user choose which node to read from. The selected node's port is used directly (no redirect to leader). PUT/DELETE still use `leaderPort(nodes)` and redirect automatically. Footer note clarifies read-from vs write-to semantics.
+
+---
+
+### `infra/docker-compose.yml` — node5 added
+
+Added `node5` as a fifth preset service (non-bootstrap, `RAFT_PEERS=""`), with `PEER_HTTP_ADDRS` covering all five nodes, named volume `node5-data`, host ports `8085:8085` and `7005:7001`.
 
 ---
 
@@ -246,7 +606,7 @@ Rules:
 ```
 All nodes start as Followers
          │
-         │ election timer fires (150–300ms random)
+         │ election timer fires (500–1000ms random)
          ▼
     Candidate
     - increment currentTerm
@@ -257,7 +617,7 @@ All nodes start as Followers
     │                                 │
     ▼ majority votes received         ▼ sees higher term or loses
   Leader                           Follower
-  - send heartbeats every 50ms     - reset election timer
+  - send heartbeats every 100ms    - reset election timer
   - replicate log entries          - wait for next heartbeat
 ```
 
@@ -265,7 +625,7 @@ All nodes start as Followers
 1. Node has not already voted in this term
 2. Candidate's log is at least as up-to-date (higher last term, or same term and longer log)
 
-**Why randomized timeouts?** If all followers had the same timeout, they would all start elections simultaneously, split votes forever, and never elect a leader. Randomization (150–300ms) ensures one node almost always times out first and wins before the others even start.
+**Why randomized timeouts?** If all followers had the same timeout, they would all start elections simultaneously, split votes forever, and never elect a leader. Randomization (500–1000ms) ensures one node almost always times out first and wins before the others even start.
 
 ### Log Replication
 
@@ -367,16 +727,16 @@ Config changes are replicated as special log entries (`IsConfig=true`). When com
 ```
 main.go
   │
-  ├─ NewHTTPTransport(":7001")    — create RPC server
+  ├─ NewGRPCTransport(":7001")    — create gRPC RPC server (protobuf over HTTP/2)
   ├─ kvstore.New(cfg)             — create KVStore + RaftNode
   │     └─ go kv.readApplyCh()   — drain committed entries
-  ├─ transport.Register(node)     — wire /raft/* HTTP routes
-  ├─ go transport.Serve()         — start Raft RPC listener
+  ├─ transport.Register(node)     — wire gRPC handlers → node (grpcHandler)
+  ├─ go transport.Serve()         — start Raft gRPC listener
   ├─ go node.Run()                — start Raft event loop
   │     ├─ n.loadState()          — restore term/votedFor/log from disk
   │     ├─ n.restoreFromSnapshot()— rebuild state machine from snapshot
   │     └─ go n.applyLoop()       — background: apply committed entries
-  └─ http.ListenAndServe(":808x") — start KVStore HTTP API
+  └─ http.ListenAndServe(":808x") — start KVStore HTTP API (clients use this)
 ```
 
 ### Write Flow (PUT)
@@ -406,9 +766,10 @@ curl -L -X PUT http://localhost:8082/keys/name?value=raft
     ┌────┴──────────────────────┐
     ▼                           ▼
   sendToPeer(node2)         sendToPeer(node3)
-  AppendEntries RPC         AppendEntries RPC
+  GRPCTransport.AppendEntries() — Go struct → proto → binary → HTTP/2
+  GRPCTransport.AppendEntries() — same
     │                           │
-    ▼ Success                   ▼ Success
+    ▼ Success (proto reply)     ▼ Success (proto reply)
   matchIndex[node2]=N       matchIndex[node3]=N
   maybeCommit()
          │
@@ -441,7 +802,7 @@ curl http://localhost:8083/keys/name
          ▼
   store.Get("name")
   kv.mu.RLock()
-  return kv.data["name"]   ← direct map lookup, no Raft log
+  return kv.data["name"]   ← direct map lookup, no Raft involved
          │
          ▼
   200 OK: "raft"
@@ -450,7 +811,7 @@ curl http://localhost:8083/keys/name
 ### Leader Election Flow
 
 ```
-node2 election timer fires (no heartbeat for 150–300ms)
+node2 election timer fires (no heartbeat for 500–1000ms)
          │
          ▼
   becomeCandidate()
@@ -497,24 +858,6 @@ Run()
 node fully recovered, rejoins as follower, no data loss
 ```
 
-### Snapshot Flow
-
-```
-kvstore applied 100 entries (snapshotThreshold = 100)
-         │
-         ▼
-kv.Snapshot() → gob.Encode(kv.data) → []byte
-         │
-         ▼
-node.TakeSnapshot(data)
-  saveSnapshot() → raft-snapshot.bin.tmp → fsync → rename
-  log.compactTo(lastApplied) → discard entries 1–100
-  persist() → raft-state.bin updated with compacted log
-         │
-  Before: [1][2]...[100][101][102]
-  After:  [snap@100][101][102]
-```
-
 ### Node Join Flow (AddPeer)
 
 ```
@@ -543,6 +886,36 @@ node.AddPeer("node4:7001")
          │
          ▼
   all 4 nodes exchange heartbeats — cluster is fully 4-node
+```
+
+### Sidecar Node Lifecycle Flow
+
+```
+User clicks "Add Node" (node4) in dashboard
+         │
+         ▼
+POST http://localhost:9090/nodes/create {"id":"node4"}
+         │
+  clearNodeData("node4")
+  ├─ docker compose rm -f -s node4     ← release volume reference
+  └─ docker volume rm infra_node4-data ← wipe stale term/log
+         │
+  docker compose up -d --no-deps --build node4
+         │
+  waitForHTTP(:8084, 30s)
+         │
+  findOnlinePortExcluding(8084)
+  ├─ Pass 1: find node with state=="leader" → port 8081
+  ├─ Pass 2: resolve via leader ID in registry
+  └─ Pass 3: any online node
+         │
+  raftAddNode(8081, "node4:7001")
+  POST http://localhost:8081/admin/add-node {"addr":"node4:7001"}
+         │
+  node4 joins cluster, leader replicates log
+         │
+         ▼
+  {"ok":true,"id":"node4"}
 ```
 
 ---
@@ -580,58 +953,9 @@ node.AddPeer("node4:7001")
                                      200 OK → client
 ```
 
-**Step-by-step:**
-
-```
-Step 1 — Client hits node2 (a follower)
-  node2: r.Method == PUT and state != Leader
-  node2: 302 redirect → http://localhost:8081/keys/name?value=alice
-
-Step 2 — Client follows redirect to node1 (leader)
-  node1: store.Set("name", "alice")
-  node1: encodes command → node.Submit(bytes)
-
-Step 3 — Leader appends to its OWN log first (does not wait for followers)
-  node1 log: [..., entry{term:1, index:5, cmd:"SET name alice"}]
-  node1: persist() → write raft-state.bin.tmp → fsync → rename
-  node1: commitIndex stays at 4 (not committed yet)
-
-Step 4 — Leader sends AppendEntries to ALL followers in parallel
-  node1 → node2: AppendEntries{PrevLogIndex:4, Entries:[entry5], LeaderCommit:4}
-  node1 → node3: AppendEntries{PrevLogIndex:4, Entries:[entry5], LeaderCommit:4}
-  node1 → node4: AppendEntries{PrevLogIndex:4, Entries:[entry5], LeaderCommit:4}
-
-Step 5 — Each follower validates and appends
-  follower checks: do I have an entry at PrevLogIndex(4) with matching term?
-  YES → append entry5 to local log → persist → reply Success
-
-Step 6 — Leader counts acknowledgements (majority check)
-  node1 gets Success from node2: matchIndex[node2]=5
-  node1 gets Success from node3: matchIndex[node3]=5
-  maybeCommit: quorum of {node1=5, node2=5, node3=5, node4=?} → quorumIdx=5
-  entry5.Term(1) == currentTerm(1) → commitIndex = 5
-
-Step 7 — Leader applies to state machine
-  applyLoop: stateMachine.Apply("SET name alice") → kv.data["name"]="alice"
-  applyCh ← ApplyMsg{Index:5, ...}
-  kvstore routes result → HTTP 200 OK → client
-
-Step 8 — Followers learn commit on next heartbeat
-  node1 → all: AppendEntries{LeaderCommit:5}
-  followers: commitIndex = 5 → applyLoop → kv.data["name"]="alice"
-
-Key points:
-  - Leader writes locally FIRST, then replicates
-  - Client gets OK after majority (not all) nodes have the entry
-  - Followers apply slightly after — reads can be ~1 heartbeat stale
-  - If leader crashes after step 6, entry is safe (majority have it)
-```
-
 ---
 
 ### Use Case 2 — Read (GET) from Any Node
-
-**Scenario:** Client reads `name` from a follower node.
 
 ```
 ┌────────┐  GET /keys/name   ┌───────────────────────────┐
@@ -642,30 +966,10 @@ Key points:
     └────────────────
 ```
 
-**Step-by-step:**
-
-```
-Step 1 — Client hits any node (doesn't matter which)
-  node3: r.Method == GET → serve locally, no redirect
-
-Step 2 — KVStore local read
-  store.Get("name")
-  kv.mu.RLock()           ← shared read lock
-  val = kv.data["name"]   ← direct map lookup, no Raft involved
-  kv.mu.RUnlock()
-  return "alice"
-
-Step 3 — Response to client
-  HTTP 200 OK: "alice"
-
 Key points:
-  - Reads NEVER go through Raft log — instant, no network hop to leader
-  - Trade-off: may return data up to 1 heartbeat (100ms) stale
-  - Example: leader committed a new value but follower's applyLoop
-    hasn't applied it yet — follower returns the old value
-  - This is called "stale read" — acceptable in most use cases
-  - For strict consistency, reads must go to leader (not implemented here)
-```
+- Reads NEVER go through Raft log — instant, no network hop to leader
+- May return data up to 1 heartbeat (~100ms) stale
+- Dashboard allows selecting which node to read from
 
 ---
 
@@ -674,227 +978,119 @@ Key points:
 **Scenario:** The current leader crashes; the cluster elects a new one.
 
 ```
-  node1 (leader, term 1) — CRASHES
+node1 (leader, term 5) — CRASHES
          │
-  node2, node3, node4 stop receiving heartbeats
+node2, node3, node4 stop receiving heartbeats
          │
-  each node's election timer counts down (500–1000ms random)
-  node3 fires first
+each node's election timer counts down (500–1000ms random)
+node3 fires first
          │
-  node3: becomeCandidate()        node2: still counting down
-  term++ → term=2                 node4: still counting down
-  votedFor = "node3"
-  persist()
+node3: becomeCandidate()        node2: still counting down
+term++ → term=6                 node4: still counting down
+votedFor = "node3"
+persist()
          │
-  node3 → RequestVote(term=2) ──► node2 (votes YES)
-  node3 → RequestVote(term=2) ──► node4 (votes YES)
+node3 → RequestVote(term=6) ──► node2 (votes YES)
+node3 → RequestVote(term=6) ──► node4 (votes YES)
          │
-  votes = 3 (self + node2 + node4) >= majority(2 of 3) = 2
+votes = 3 >= majority(2) → becomeLeader()
          │
-  node3: becomeLeader()
-  nextIndex[node2]=lastIndex+1, nextIndex[node4]=lastIndex+1
-  matchIndex[*]=0
-         │
-  node3 → heartbeat ──► node2, node4
-  node2, node4: reset election timers, leaderID="node3"
-```
-
-**Step-by-step:**
-
-```
-Step 1 — Heartbeat timeout
-  node1 was sending heartbeats every 100ms
-  node1 crashes → no more heartbeats
-  node3's election timer reaches 0 (fired at ~600ms)
-
-Step 2 — node3 becomes Candidate
-  n.state = Candidate
-  n.currentTerm++ (1 → 2)
-  n.votedFor = "node3"
-  persist() → term and vote written to disk (crash-safe)
-
-Step 3 — node3 sends RequestVote to all peers in parallel
-  RequestVoteArgs{Term:2, CandidateID:"node3",
-                  LastLogIndex:4, LastLogTerm:1}
-
-Step 4 — Each peer decides whether to vote
-  Voter checks TWO conditions:
-    a) Has it already voted in term 2? NO → can vote
-    b) Is node3's log at least as up-to-date?
-       node3.LastLogTerm(1) vs voter.lastTerm(1) → equal
-       node3.LastLogIndex(4) vs voter.lastIndex(4) → equal
-       → UP-TO-DATE → grant vote
-
-Step 5 — node3 counts votes
-  node3 gets vote from node2: votes=2
-  node3 gets vote from node4: votes=3
-  votes(3) >= majority(2) → becomeLeader()
-
-Step 6 — node3 becomes Leader
-  n.state = Leader
-  n.leaderID = "node3"
-  Initialize: nextIndex[node2]=5, nextIndex[node4]=5
-              matchIndex[node2]=0, matchIndex[node4]=0
-
-Step 7 — node3 sends first heartbeat
-  node2, node4 receive AppendEntries{Term:2, LeaderID:"node3"}
-  → reset election timers → leaderID = "node3"
-
-Key points:
-  - Randomized timeouts (500–1000ms) ensure only ONE node fires first
-  - Two conditions for vote: haven't voted + log is up-to-date
-  - Log up-to-date check prevents a stale node from becoming leader
-  - Higher last term wins outright; equal terms use log length
-  - node1 eventually restarts: sees term=2 > its term=1 → becomes follower
+node3 → heartbeat ──► node2, node4
 ```
 
 ---
 
 ### Use Case 4 — Follower Crash and Recovery
 
-**Scenario:** node3 crashes while cluster is running; writes happen during downtime; node3 restarts.
+**Scenario:** node3 crashes; writes happen during downtime; node3 restarts.
 
 ```
-  node3 crashes (docker stop / power cut)
+node3 crashes → leader keeps replicating to node2, node4
+writes during downtime: SET a=1, SET b=2, SET c=3
          │
-  node1 (leader) keeps replicating to node2, node4
-  writes during downtime: SET a=1, SET b=2, SET c=3
+node3 restarts → loadState() → restoreSnapshot() → go applyLoop()
          │
-  node3 restarts (docker start)
-         │
-  Run() begins:
-  loadState()         restore term, votedFor, log from disk
-  restoreSnapshot()   rebuild KVStore from last snapshot (if any)
-  go applyLoop()      ready to apply committed entries
-         │
-  node1 sends heartbeat to node3:
-  AppendEntries{PrevLogIndex:7, PrevLogTerm:1, LeaderCommit:7}
-         │
-  node3 log consistency check:
-  "do I have index 7?" → NO → ConflictIndex = lastIndex+1
-         │
-  node1: backs up nextIndex[node3] → resends from index 5
-  node3: appends entries 5,6,7 → replies Success
-         │
-  node3: commitIndex=7 → applyLoop applies entries 5,6,7
-  kv.data["a"]="1", kv.data["b"]="2", kv.data["c"]="3"
-         │
-  node3 fully recovered, all data present
-```
-
-**Step-by-step:**
-
-```
-Step 1 — node3 crashes
-  raft-state.bin on disk: term=1, log=[1..4] (last checkpoint)
-  raft-snapshot.bin: snapshot@3 (if taken)
-  volatile state (commitIndex, peers) lost
-
-Step 2 — Cluster continues without node3
-  node1+node2 = 2 out of 3 = majority → writes still accepted
-  entries 5,6,7 committed on node1+node2
-
-Step 3 — node3 restarts
-  loadState(): read raft-state.bin
-    currentTerm=1, votedFor="", log=[1..4]
-  restoreSnapshot(): read raft-snapshot.bin
-    rebuild kv.data from snapshot
-    lastApplied=3, commitIndex=3
-  go applyLoop(): background loop started, waits for commitNotify
-
-Step 4 — node3 receives first heartbeat from leader (node1)
-  AppendEntries{Term:1, PrevLogIndex:4, Entries:[5,6,7], LeaderCommit:7}
-  Log consistency check: log.get(4).Term == 1 → matches
-  Append entries 5,6,7 to local log
-  commitIndex = min(LeaderCommit=7, lastIndex=7) = 7
-  notifyCommit()
-
-Step 5 — applyLoop catches up
-  lastApplied=3, commitIndex=7
-  Apply entry 4 → kv.data updated
-  Apply entry 5 → kv.data["a"]="1"
-  Apply entry 6 → kv.data["b"]="2"
-  Apply entry 7 → kv.data["c"]="3"
-
-Step 6 — node3 fully recovered
-  state=follower, leader="node1", commitIndex=7, lastApplied=7
-  No manual intervention needed
-  All data present — nothing lost
-
-Key points:
-  - Disk persistence (raft-state.bin) survives crashes
-  - On restart, volatile state is 0/nil; only persisted state restored
-  - Leader sends missing entries on first heartbeat
-  - If node3 missed 1000+ entries, leader may send snapshot instead
-    (InstallSnapshot RPC) to avoid replaying the full log
+leader sends heartbeat: AppendEntries{PrevLogIndex:7, LeaderCommit:7}
+node3 log check fails → ConflictIndex = lastIndex+1
+leader backs up nextIndex[node3] → resends from correct index
+node3 appends, applies entries → fully recovered
 ```
 
 ---
 
-### Use Case 5 — Snapshot and Log Compaction
+### Use Case 5 — Node Stop and Re-add (via Dashboard)
 
-**Scenario:** After 100 entries applied, the KVStore takes a snapshot to reclaim disk space.
-
-```
-  log: [1][2][3]...[98][99][100][101][102]
-       ↑                    ↑
-       old entries       lastApplied=100
-
-  kv.Snapshot() → gob.Encode(kv.data) → []byte{...}
-  node.TakeSnapshot(bytes)
-
-  log: [snap@100][101][102]
-        ↑ sentinel
-        (entries 1–100 discarded from memory and disk)
-```
-
-**Step-by-step:**
+**Scenario:** User stops node2 and later re-adds it. Without data clearing, node2 restarts with a stale high term and disrupts the leader.
 
 ```
-Step 1 — Application decides to snapshot
-  kvstore: if len(applied) >= snapshotThreshold(100)
-  kv.Snapshot() → gob.Encode(kv.data) → snapshot bytes
+User stops node2:
+  sidecar → raftRemoveNode(leaderPort, "node2:7001")
+  cluster removes node2 from membership (2-node cluster remains)
+  sidecar → docker compose stop node2
+         │
+node2 container exits, volume infra_node2-data retains:
+  currentTerm=28, votedFor="...", log=[...]
+         │
+User adds node2 again:
+  sidecar → clearNodeData("node2")
+    docker compose rm -f -s node2  ← releases volume reference
+    docker volume rm infra_node2-data
+  sidecar → docker compose up --build node2
+    new empty volume created
+    node2 starts at term=0
+  sidecar → findOnlinePortExcluding(8082) → leader port
+  sidecar → raftAddNode(leaderPort, "node2:7001")
+  leader replicates log → node2 catches up as follower
+         │
+         ▼
+No term disruption. Cluster stable.
 
-Step 2 — Raft compacts the log
-  node.TakeSnapshot(data):
-    index = lastApplied = 100
-    term  = log.get(100).Term
-    saveSnapshot(index, term, data)  ← atomic write to raft-snapshot.bin
-    snapshotData = data
-    log.compactTo(100, term)
-      entries[0] = {Index:100, Term:1}  ← new sentinel
-      entries 1–100 discarded (GC'd)
-    persist()  ← raft-state.bin updated (log now starts at sentinel)
-
-Step 3 — A new follower joins and needs entry 50 (compacted)
-  leader: nextIndex[newNode] = 51 (backed up during consistency check)
-  leader: nextIndex[newNode](51) <= snapshotIndex(100)
-  → send InstallSnapshot instead of AppendEntries
-  InstallSnapshotArgs{LastIncludedIndex:100, LastIncludedTerm:1, Data:bytes}
-
-Step 4 — Follower installs snapshot
-  HandleInstallSnapshot:
-    log.compactTo(100, 1)   ← fast-forward log to snapshot boundary
-    lastApplied = 100
-    commitIndex = 100
-    snapshotNotifyC ← snap  ← signal applyLoop to restore
-
-Step 5 — applyLoop restores state machine
-  stateMachine.Restore(data) → rebuild kv.data from snapshot bytes
-  follower now has full state at index 100
-  leader resumes AppendEntries from index 101
-
-Key points:
-  - Application drives when to snapshot (it knows when state is consistent)
-  - Raft controls which index to compact to (lastApplied)
-  - Atomic write pattern: tmp → fsync → rename (crash-safe)
-  - InstallSnapshot is used when log entries are compacted away
-  - After snapshot, new nodes catch up in one RPC instead of replaying log
+  WITHOUT clearNodeData (old behavior):
+    node2 restarts with term=28, cluster at term=12
+    node2 sends heartbeat response with term=28
+    → leader sees term=28 > 12 → steps down
+    → cluster triggers new election at term=28+
+    → instability for several election cycles
 ```
 
 ---
 
-### Use Case 6 — Adding a Node Live (Dynamic Membership)
+### Use Case 6 — Dynamic Custom Node (via Dashboard)
+
+**Scenario:** User adds a node with a custom ID "node-alpha" at port 8090.
+
+```
+User fills form: ID=node-alpha, HTTP=8090, RPC=7090
+         │
+POST /nodes/create {"id":"node-alpha","http_port":8090,"rpc_port":7090}
+         │
+sidecar: getBuiltImage()
+  → docker image inspect infra-node1 → sha256:4c50...
+         │
+sidecar: docker run -d \
+  --name raft-node-alpha \
+  --network infra_default \
+  --hostname node-alpha \
+  -p 8090:8090 -p 7090:7001 \
+  -e NODE_ID=node-alpha \
+  -e RAFT_PEERS= \
+  -e HTTP_ADDR=:8090 \
+  -e DATA_DIR=/data \
+  -e PEER_HTTP_ADDRS=node1=localhost:8081,...,node-alpha=localhost:8090 \
+  infra-node1
+         │
+waitForHTTP(:8090) → node-alpha online
+         │
+findOnlinePortExcluding(8090) → leader port
+raftAddNode(leaderPort, "node-alpha:7001")
+         │
+node-alpha receives log entries, joins as follower
+addDynamicNode() → registered in sidecar's runtime registry
+```
+
+---
+
+### Use Case 7 — Adding a Node Live (Dynamic Membership)
 
 **Scenario:** Add node4 to a running 3-node cluster without stopping it.
 
@@ -902,7 +1098,6 @@ Key points:
   3-node cluster: node1(leader), node2, node3
   Quorum = 2 of 3
 
-         │
   docker compose up node4 -d
   node4 starts with RAFT_PEERS="" → no elections (empty-peers guard)
          │
@@ -915,74 +1110,20 @@ Key points:
   node1 → AppendEntries ──► node2, node3, node4 (config entry + backfill)
          │
   node4 catches up from index 1
-  (or via InstallSnapshot if log compacted)
-         │
   majority acks (node1+node2+node3 = 3) → config entry commits
-         │
-  applyConfigEntry on each node:
-    node2, node3: add "node4:7001" to n.peers
-    node4: skip (own SelfAddr)
          │
   4-node cluster: quorum = 3 of 4
 ```
 
-**Step-by-step:**
-
-```
-Step 1 — Start node4 container
-  node4 starts with RAFT_PEERS="" → len(peers)=0
-  Empty-peers guard: election timer fires but no election started
-  node4 waits silently
-
-Step 2 — Leader receives add-node request
-  POST /admin/add-node {"addr":"node4:7001"} → node1 (leader)
-  node1.AddPeer("node4:7001"):
-    append LogEntry{IsConfig:true, ConfigOp:"add", ConfigPeer:"node4:7001"}
-    persist()
-    n.peers = append(n.peers, "node4:7001")  ← add IMMEDIATELY
-    nextIndex["node4:7001"] = lastIndex+1
-    matchIndex["node4:7001"] = 0
-    trigger replication to ALL peers including node4
-
-Step 3 — node4 receives first AppendEntries
-  node4 has empty log → fails consistency check
-  ConflictIndex = 1 (log too short)
-  leader backs up: nextIndex[node4] = 1
-  leader resends ALL entries from index 1
-
-Step 4 — node4 catches up
-  node4 appends all entries 1..N including the add-node config entry
-  node4 applies the config entry: ConfigPeer("node4:7001") == SelfAddr → skip
-
-Step 5 — Config entry commits
-  node1+node2+node3 acknowledge → majority of new 4-node cluster
-  commitIndex advances past config entry
-  applyLoop on node2, node3: applyConfigEntry("add","node4:7001")
-    → n.peers = append(n.peers, "node4:7001")
-
-Step 6 — 4-node cluster fully operational
-  All nodes: peers = [node1, node2, node3, node4]
-  Leader now needs 3 of 4 for quorum (was 2 of 3)
-
-Key points:
-  - Leader adds node4 to peers BEFORE commit so replication starts early
-  - Single-server change: only one node added at a time — safe because
-    any two majorities (old 2-of-3 and new 3-of-4) overlap by 1 node
-  - node4 can catch up via log replay or InstallSnapshot
-  - Quorum increases from 2→3 as soon as node4 is in peers
-```
-
 ---
 
-### Use Case 7 — Removing a Follower Safely
+### Use Case 8 — Removing a Node Safely
 
 **Scenario:** Permanently remove node3 (a follower) from the cluster.
 
 ```
   4-node cluster: node1(leader), node2, node3, node4
   Quorum = 3 of 4
-         │
-  Step 1: docker stop node3   ← container stopped (optional but safe)
          │
   POST /admin/remove-node {"addr":"node3:7001"}
          │
@@ -993,131 +1134,7 @@ Key points:
     node1, node2, node4: remove "node3:7001" from n.peers
     node3 (if running): ConfigPeer==SelfAddr → clear all peers → stop elections
          │
-  3-node cluster: node1, node2, node4
-  Quorum = 2 of 3
-```
-
-**Step-by-step:**
-
-```
-Step 1 — (Optional) Stop node3 container
-  docker stop node3
-  node1 tries heartbeats to node3 → timeout → retry next tick
-  node1+node2+node4 = 3 of 4 → still majority → writes continue
-
-Step 2 — Submit remove-node to leader
-  POST /admin/remove-node {"addr":"node3:7001"}
-  node1.RemovePeer("node3:7001"):
-    "node3:7001" found in n.peers → submitConfigLocked("remove","node3:7001")
-    append LogEntry{IsConfig:true, ConfigOp:"remove", ConfigPeer:"node3:7001"}
-    persist()
-    trigger replication (node3 still in peers for now, keeps receiving)
-
-Step 3 — Config entry replicates and commits
-  node1+node2+node4 acknowledge → 3 of 4 = majority → commit
-
-Step 4 — applyConfigEntry on each node
-  node1: remove "node3:7001" from n.peers, delete nextIndex/matchIndex
-  node2: same
-  node4: same
-  node3 (if running): ConfigPeer("node3:7001") == SelfAddr
-    → n.peers = nil
-    → nextIndex/matchIndex cleared
-    → node3 now isolated: empty peers, no elections, no disruption
-
-Step 5 — 3-node cluster
-  peers = [node1, node2, node4], quorum = 2 of 3
-  node3 is silent (no peers to start elections with)
-
-Key points:
-  - Config entry is replicated to node3 too (while it's still in peers)
-  - node3 applies "remove self" → clears peers → empty-peers guard silences it
-  - Clean removal: no disruption to cluster during or after
-  - If you restart node3 later, it will still be silent (peers=nil in memory)
-    but on restart, RAFT_PEERS env var restores peers → need add-node again
-```
-
----
-
-### Use Case 8 — Removing the Leader (Special Case)
-
-**Scenario:** node1 IS the leader. Client calls remove-node for node1.
-
-```
-  node1 (leader), node2, node3, node4
-         │
-  POST /admin/remove-node {"addr":"node1:7001"}
-  → node1 (leader) receives it directly
-         │
-  Step 1: node1 submits config entry for own removal
-  (special case: self is never in n.peers, checked via SelfAddr)
-         │
-  Step 2: config entry replicates to node2, node3, node4
-  majority (node1 + node2 + node3) acks → commit
-         │
-  Step 3: applyConfigEntry on node1
-  ConfigPeer == SelfAddr:
-    n.peers = nil
-    n.state = Follower   ← STEP DOWN
-    n.leaderID = ""
-    heartbeats stop going out
-         │
-  Step 4: node2, node3, node4 election timers fire (500–1000ms)
-  new leader elected among them
-         │
-  LIMITATION: The remove-node entry (index N) was committed by node1
-  but node1 stepped down before sending LeaderCommit=N to followers.
-  New leader has the entry in its log but can't commit it until
-  it commits a NEW entry in its own term (Raft §5.4.2).
-         │
-  Step 5: Do ANY write → new leader commits term-2 entry
-  entry N (remove-node) cascades through → applied on new leader
-  node1 removed from all peers permanently
-```
-
-**Step-by-step:**
-
-```
-Step 1 — remove-node submitted to leader (self)
-  RemovePeer("node1:7001"):
-    rpcAddr == n.config.SelfAddr → special path (not in n.peers)
-    → submitConfigLocked("remove","node1:7001") → append config entry
-
-Step 2 — Config entry commits
-  node2, node3, node4 acknowledge → majority with node1 = commit
-  node1's applyLoop applies the entry
-
-Step 3 — node1 steps down immediately
-  applyConfigEntry: ConfigPeer=="node1:7001" == SelfAddr
-    n.peers = nil
-    n.state = Follower
-    n.leaderID = ""
-  heartbeatTicker.C fires: n.state != Leader → sendHeartbeats skipped
-  No more heartbeats reach node2, node3, node4
-
-Step 4 — New election
-  node2/3/4 election timers fire after 500–1000ms
-  one wins, becomes new leader (term+1)
-
-Step 5 — The cascading commit problem
-  New leader (say node3) has the remove entry in its log at index N
-  but commitIndex=N-1 (never learned from node1 that N was committed)
-  Raft §5.4.2: cannot commit previous-term entries by replica counting
-  → stuck until a new same-term entry commits
-
-Step 6 — Trigger resolution
-  Submit any write → new leader appends entry at index N+1, term=2
-  majority acks → commitIndex = N+1
-  applyLoop: applies entry N (remove-node) then N+1 (the write)
-  node1 removed from node3's peers → heartbeats to node1 stop
-
-Key points:
-  - The "cascading commit" delay is unique to leader self-removal
-  - For follower removal, leader sends LeaderCommit immediately → clean
-  - Production fix: no-op entry appended right after becoming leader
-    (automatically commits all previous-term entries)
-  - Alternative: leader transfer (hand off leadership before removing self)
-  - In THIS implementation: just do any write after remove-node to resolve
+  3-node cluster: node1, node2, node4 — Quorum = 2 of 3
 ```
 
 ---
@@ -1127,71 +1144,17 @@ Key points:
 **Scenario:** Network splits into {node1, node2} and {node3, node4}. node1 is leader.
 
 ```
-  Before partition:
-  node1(leader) ←──► node2
-       │                │
-       ▼                ▼
-  node3 ◄─────────► node4
-
   PARTITION:
-  Side A: node1(leader), node2   ← minority (2 of 4)
-  Side B: node3, node4           ← minority (2 of 4)
-         │
-  Side A: node1 tries to commit writes
-  node1 + node2 = 2 of 4 → NOT majority → writes BLOCKED
-         │
-  Side B: node3 or node4 election timer fires
-  RequestVote → only gets 2 votes (self + 1) → NOT majority → no leader
-         │
-  BOTH sides are blocked — no split brain
-         │
+  Side A: node1(leader), node2   ← 2 of 4 — NOT majority
+  Side B: node3, node4           ← 2 of 4 — NOT majority
+
+  Side A: node1 + node2 = 2 of 4 → writes BLOCKED (need 3)
+  Side B: node3 or node4 can't win election (need 3 votes)
+
+  BOTH sides deadlocked — no split brain
+
   Partition heals:
-  node1+node2+node3+node4 reconnected
-  One leader elected, cluster resumes
-```
-
-**Step-by-step:**
-
-```
-Step 1 — Partition occurs
-  Side A (node1, node2): can talk to each other
-  Side B (node3, node4): can talk to each other
-  No cross-partition communication
-
-Step 2 — Side A (node1 as leader) tries to commit
-  node1: append entry → send AppendEntries to node2, node3, node4
-  node2 replies → matchIndex[node2]=N
-  node3, node4 → timeout (unreachable)
-  maybeCommit: quorum needs 3 of 4
-    {node1=N, node2=N, node3=0, node4=0} → quorumIdx=0
-    0 > commitIndex? NO → write STALLED
-  Client gets no response (timeout)
-
-Step 3 — Side B tries to elect a leader
-  node3's election timer fires → becomeCandidate(term=2)
-  RequestVote → node4 only → 2 votes of 4 → NOT majority
-  node3 can't win → back to follower at higher term
-  Same for node4
-
-Step 4 — Both sides deadlocked
-  No writes on Side A (can't reach majority)
-  No leader on Side B (can't reach majority)
-  This is CORRECT behavior — better to stop than to diverge
-
-Step 5 — Partition heals
-  node1, node2 regain connectivity to node3, node4
-  node3/node4 have term=2 (from failed elections)
-  node1 receives message with term=2 → becomeFollower(term=2)
-  Election happens → one leader elected at term=2 or higher
-  Cluster resumes, all nodes converge on same log
-
-Key points:
-  - Majority quorum PREVENTS split brain: 2 minority groups can't both commit
-  - 4-node cluster needs 3 for quorum — one partition of 2 can never proceed
-  - 3-node cluster needs 2 for quorum — one partition of 2 CAN proceed
-    (safe because only one side of 2-1 has majority)
-  - A node in the minority simply stalls — it doesn't corrupt state
-  - When partition heals, higher-term messages automatically reconcile state
+  All 4 reconnect → one leader elected → cluster resumes
 ```
 
 ---
@@ -1203,21 +1166,49 @@ Key points:
 - Go 1.21+
 - Docker Desktop
 - Docker Compose v2
+- Node.js 18+ (for dashboard)
+- `grpcurl` (optional): `brew install grpcurl`
 
-### Quick Start (Docker)
+### Quick Start
+
+**1. Start the Raft cluster (bootstrap nodes):**
+```bash
+# Start 3 bootstrap nodes (they self-form the cluster)
+# Use the dashboard instead — see step 3
+```
+
+**2. Start the sidecar:**
+```bash
+go run ./cmd/sidecar
+# → sidecar listening on :9090
+```
+
+**3. Start the dashboard:**
+```bash
+cd dashboard
+npm install
+npm run dev
+# → open http://localhost:5173
+```
+
+**4. Add nodes from the UI:**
+- Click "Add Node" in the Cluster Control panel
+- Type `node1` → ports auto-fill from preset → click "Start Node"
+- Repeat for `node2`, `node3`
+- The cluster self-bootstraps; a leader is elected within ~1 second
+
+**5. Add custom nodes:**
+- Type any ID (e.g. `node-alpha`), enter HTTP port (e.g. 8090), RPC port (optional)
+- The sidecar starts a container via `docker run` and calls `add-node` on the leader
+
+### Clean Up Everything
 
 ```bash
-# Clone
-git clone https://github.com/AK9175/Raft-Implementation.git
-cd Raft-Implementation
+# Stop and remove all containers + named volumes
+docker compose -f infra/docker-compose.yml down -v
 
-# Start 3-node cluster
-docker compose -f infra/docker-compose.yml up --build node1 node2 node3 -d
-
-# Verify
-curl http://localhost:8081/status
-curl http://localhost:8082/status
-curl http://localhost:8083/status
+# Remove any custom nodes started via docker run
+docker ps -a --filter name=raft- --format "{{.Names}}" | xargs -r docker rm -f
 ```
 
 ### Local Run (without Docker)
@@ -1248,14 +1239,14 @@ go run ./cmd/kvstore
 Each container has its own network namespace — they don't share ports. `node1`, `node2`, `node3` all listen on `:7001` inside their own container. The host maps them to different ports (`7001`, `7002`, `7003`) only for external access.
 
 **How containers resolve each other:**
-Docker Compose creates a bridge network. Each service name becomes a DNS entry. `node2:7001` inside the Docker network resolves to node2's container IP on port 7001.
+Docker Compose creates a bridge network (`infra_default`). Each service name becomes a DNS entry. `node2:7001` inside the Docker network resolves to node2's container IP on port 7001.
 
 **Why `PEER_HTTP_ADDRS` uses `localhost` not container names:**
 The 302 redirect URL must be resolvable by the **client** (curl on the host machine), not by containers. `node2:8082` doesn't resolve on the host, but `localhost:8082` does (via Docker port binding).
 
 **Persistent state:**
 ```
-Docker named volume:  raft-implementation_node1-data
+Docker named volume:  infra_node1-data
 Mounted at:           /data inside container
 Files:
   /data/raft-state.bin      — term, votedFor, log entries
@@ -1270,372 +1261,64 @@ Files:
 | `RAFT_RPC_ADDR` | Yes | `:7001` | Address to listen for Raft RPCs |
 | `HTTP_ADDR` | Yes | `:8081` | Address for KVStore HTTP API |
 | `DATA_DIR` | Yes | `/data` | Directory for persistent state |
-| `RAFT_PEERS` | No | `node2:7001,node3:7001` | Peer Raft RPC addresses |
+| `RAFT_PEERS` | No | `node2:7001,node3:7001` | Peer Raft RPC addresses (bootstrap cluster) |
 | `PEER_HTTP_ADDRS` | No | `node1=localhost:8081,...` | Peer HTTP addresses for client redirects |
-| `NODE_RPC_ADDR` | No | `node1:7001` | Override self RPC address for membership changes |
 
-### Cluster Operations
+### Manual Cluster Operations (curl)
 
-**Start cluster:**
 ```bash
-docker compose -f infra/docker-compose.yml up --build node1 node2 node3 -d
-```
-
-**Add node4:**
-```bash
-docker compose -f infra/docker-compose.yml up node4 -d
-curl -L -X POST http://localhost:8081/admin/add-node \
+# Add a node
+curl -X POST http://localhost:8081/admin/add-node \
      -H "Content-Type: application/json" \
      -d '{"addr":"node4:7001"}'
-```
 
-**Remove a node safely (stop first, then remove):**
-```bash
-docker compose -f infra/docker-compose.yml stop node3
-curl -L -X POST http://localhost:8081/admin/remove-node \
+# Remove a node
+curl -X POST http://localhost:8081/admin/remove-node \
      -H "Content-Type: application/json" \
      -d '{"addr":"node3:7001"}'
-```
 
-**Temporary stop vs permanent removal — critical distinction:**
-
-Docker manages containers. The admin API manages cluster membership. They are independent layers.
-
-| Intent | Docker | Admin API | Bring back |
-|---|---|---|---|
-| Temporary maintenance | `docker stop node3` | do NOT call remove-node | `docker start node3` — rejoins automatically |
-| Permanent removal | `docker stop node3` | call `remove-node` | `docker start node3` + call `add-node` |
-
-```
-WRONG — starts container after remove-node without add-node:
-  docker stop node3
-  POST /admin/remove-node          ← node3 removed from cluster peers
-  docker start node3               ← node3 gets no heartbeats, starts elections
-                                      → disrupts cluster with high-term RPCs
-
-RIGHT — temporary stop (no membership change):
-  docker stop node3                ← still in peers, leader keeps trying to replicate
-  docker start node3               ← receives heartbeat, rejoins as follower automatically
-
-RIGHT — permanent removal then re-add:
-  docker stop node3
-  POST /admin/remove-node          ← officially removed from cluster
-  docker start node3               ← container running but not in cluster
-  POST /admin/add-node             ← officially re-added, leader starts heartbeats
-                                      node3 receives heartbeat, becomes follower
-```
-
-**Simulate leader failure:**
-```bash
-# Find leader
-curl http://localhost:8081/status | grep leader
-
-# Stop it
-docker compose -f infra/docker-compose.yml stop node1
-
-# Observe new election (~300ms)
-curl http://localhost:8082/status
-```
-
-**Restart a crashed node:**
-```bash
-docker compose -f infra/docker-compose.yml start node1
-# recovers automatically: loadState → catch up → rejoin as follower
-```
-
-**Full teardown:**
-```bash
-docker compose -f infra/docker-compose.yml down -v --rmi all
-```
-
----
-
-## Testing
-
-A complete set of scenarios to verify every feature of the cluster.
-
----
-
-### Test 1 — Basic CRUD
-
-```bash
-# Write to any node (redirects to leader automatically)
+# Write
 curl -L -X PUT "http://localhost:8081/keys/name?value=raft"
-curl -L -X PUT "http://localhost:8082/keys/version?value=1.0"
-curl -L -X PUT "http://localhost:8083/keys/status?value=running"
 
-# Read from any node (served locally, no redirect)
-curl http://localhost:8081/keys/name
-curl http://localhost:8082/keys/version
-curl http://localhost:8083/keys/status
-
-# Delete
-curl -L -X DELETE "http://localhost:8081/keys/version"
-
-# Verify deleted
-curl http://localhost:8082/keys/version   # → 404 not found
-```
-
----
-
-### Test 2 — Redirect Behaviour
-
-```bash
-# Write to a follower — should get 302 redirect to leader
-# Without -L: shows redirect, no data written
-curl -v -X PUT "http://localhost:8082/keys/test?value=hello" 2>&1 | grep "< HTTP"
-# → HTTP/1.1 302 Found
-
-# With -L: follows redirect, data written
-curl -L -X PUT "http://localhost:8082/keys/test?value=hello"
-# → OK
-
-# GET never redirects — always served locally
-curl -v "http://localhost:8082/keys/test" 2>&1 | grep "< HTTP"
-# → HTTP/1.1 200 OK  (no redirect)
-```
-
----
-
-### Test 3 — Replication Across All Nodes
-
-```bash
-# Write on leader
-curl -L -X PUT "http://localhost:8081/keys/replicated?value=yes"
-
-# Read from every node — all should return the same value
-curl http://localhost:8081/keys/replicated
-curl http://localhost:8082/keys/replicated
-curl http://localhost:8083/keys/replicated
-curl http://localhost:8084/keys/replicated
-```
-
----
-
-### Test 4 — Leader Election
-
-```bash
-# Find current leader
-curl http://localhost:8081/status | grep leader
-
-# Stop the leader (say node1)
-docker compose -f infra/docker-compose.yml stop node1
-
-# Wait ~300ms for new election, then check
-curl http://localhost:8082/status
-curl http://localhost:8083/status
-# → new leader elected, term incremented by 1
-
-# Writes still work through new leader
-curl -L -X PUT "http://localhost:8082/keys/after-election?value=cluster-alive"
-
-# Bring node1 back — rejoins as follower automatically
-docker compose -f infra/docker-compose.yml start node1
-curl http://localhost:8081/status
-# → state: follower, same leader as node2/node3
-```
-
----
-
-### Test 5 — Data Durability After Crash
-
-```bash
-# Write before crash
-curl -L -X PUT "http://localhost:8081/keys/before-crash?value=persisted"
-
-# Stop a node
-docker compose -f infra/docker-compose.yml stop node3
-
-# Write while node3 is down
-curl -L -X PUT "http://localhost:8081/keys/during-crash?value=also-persisted"
-
-# Restart node3
-docker compose -f infra/docker-compose.yml start node3
-
-# Wait a second for catch-up
-sleep 1
-
-# Both keys should be on node3
-curl http://localhost:8083/keys/before-crash    # → persisted
-curl http://localhost:8083/keys/during-crash    # → also-persisted
-```
-
----
-
-### Test 6 — Node Failure Does Not Lose Data
-
-```bash
-# Write to cluster
-curl -L -X PUT "http://localhost:8081/keys/durable?value=safe"
-
-# Verify all 4 nodes have it
-curl http://localhost:8081/keys/durable
-curl http://localhost:8082/keys/durable
-curl http://localhost:8083/keys/durable
-curl http://localhost:8084/keys/durable
-
-# Stop 1 node (cluster still has majority)
-docker compose -f infra/docker-compose.yml stop node4
-
-# Writes still work (3 of 4 nodes up = majority)
-curl -L -X PUT "http://localhost:8081/keys/while-down?value=still-works"
-
-# Bring node4 back
-docker compose -f infra/docker-compose.yml start node4
-sleep 1
-
-# node4 caught up — has both keys
-curl http://localhost:8084/keys/durable
-curl http://localhost:8084/keys/while-down
-```
-
----
-
-### Test 7 — Heartbeat Monitoring
-
-```bash
-# Check heartbeat counters growing in real time
-curl http://localhost:8081/status   # leader: heartbeats_sent growing
-curl http://localhost:8082/status   # follower: heartbeats_received growing
-
-# Run twice with a gap and compare counts
-curl -s http://localhost:8081/status | grep heartbeats_sent
-sleep 5
-curl -s http://localhost:8081/status | grep heartbeats_sent
-# → should have increased by ~100 (20 heartbeats/sec × 5 sec)
-```
-
----
-
-### Test 8 — Dynamic Membership (Add Node)
-
-```bash
-# Start with 3-node cluster (node1, node2, node3)
-# Write some data
-curl -L -X PUT "http://localhost:8081/keys/before-join?value=existed"
-
-# Start node4 container
-docker compose -f infra/docker-compose.yml up node4 -d
-
-# Add node4 to cluster
-curl -L -X POST http://localhost:8081/admin/add-node \
-     -H "Content-Type: application/json" \
-     -d '{"addr":"node4:7001"}'
-
-# Verify node4 is follower and has old data
-curl http://localhost:8084/status              # state: follower
-curl http://localhost:8084/keys/before-join    # → existed (replicated)
-
-# Write after join — node4 should get it too
-curl -L -X PUT "http://localhost:8081/keys/after-join?value=new-data"
-curl http://localhost:8084/keys/after-join     # → new-data
-```
-
----
-
-### Test 9 — Dynamic Membership (Remove Node)
-
-```bash
-# Stop target node first
-docker compose -f infra/docker-compose.yml stop node3
-
-# Remove from cluster config
-curl -L -X POST http://localhost:8081/admin/remove-node \
-     -H "Content-Type: application/json" \
-     -d '{"addr":"node3:7001"}'
-
-# Cluster now has node1, node2, node4
-curl http://localhost:8081/status   # commit_index advanced
-curl http://localhost:8082/status
-curl http://localhost:8084/status
-
-# Writes still work (3-node cluster, quorum = 2)
-curl -L -X PUT "http://localhost:8081/keys/after-remove?value=3-nodes"
-curl http://localhost:8084/keys/after-remove   # → 3-nodes
-```
-
----
-
-### Test 10 — Re-add a Removed Node
-
-```bash
-# After Test 9 (node3 removed), bring it back
-docker compose -f infra/docker-compose.yml up node3 -d
-
-# Add it back to cluster
-curl -L -X POST http://localhost:8081/admin/add-node \
-     -H "Content-Type: application/json" \
-     -d '{"addr":"node3:7001"}'
-
-# node3 should be follower with all data caught up
-curl http://localhost:8083/status
-curl http://localhost:8083/keys/after-remove   # → 3-nodes
-```
-
----
-
-### Test 11 — Majority Loss (Cluster Unavailable)
-
-```bash
-# Stop 2 nodes in a 3-node cluster (loses majority)
-docker compose -f infra/docker-compose.yml stop node2
-docker compose -f infra/docker-compose.yml stop node3
-
-# Writes fail — no majority to commit
-curl -L -X PUT "http://localhost:8081/keys/no-majority?value=blocked"
-# → 503 timed out waiting for commit (after 5 seconds)
-
-# Reads still work from surviving node (local state machine)
-curl http://localhost:8081/keys/before-join    # → existed
-
-# Restore majority
-docker compose -f infra/docker-compose.yml start node2
-docker compose -f infra/docker-compose.yml start node3
-
-# Writes work again
-curl -L -X PUT "http://localhost:8081/keys/restored?value=back"
+# Read from any node
+curl http://localhost:8083/keys/name
 ```
 
 ---
 
 ## API Reference
 
-### KVStore HTTP API
+### KVStore HTTP API (`:808x`)
 
 | Method | Path | Description |
 |---|---|---|
 | `PUT` | `/keys/{key}?value={val}` | Write a key-value pair |
-| `GET` | `/keys/{key}` | Read a value (served locally) |
+| `GET` | `/keys/{key}` | Read a value (served locally, may be stale) |
 | `DELETE` | `/keys/{key}` | Delete a key |
-| `GET` | `/status` | Node health and Raft state |
+| `GET` | `/status` | Node health, Raft state, and counters |
+| `GET` | `/log` | Full replication log (dashboard use) |
 | `POST` | `/admin/add-node` | Add a node to the cluster |
 | `POST` | `/admin/remove-node` | Remove a node from the cluster |
-
-```bash
-# Write (redirects to leader automatically with -L)
-curl -L -X PUT "http://localhost:8081/keys/name?value=raft"
-
-# Read from any node
-curl "http://localhost:8083/keys/name"
-
-# Delete
-curl -L -X DELETE "http://localhost:8082/keys/name"
-
-# Add node
-curl -L -X POST http://localhost:8081/admin/add-node \
-     -H "Content-Type: application/json" \
-     -d '{"addr":"node4:7001"}'
-
-# Remove node
-curl -L -X POST http://localhost:8081/admin/remove-node \
-     -H "Content-Type: application/json" \
-     -d '{"addr":"node3:7001"}'
-```
 
 **Redirect behaviour:**
 - `PUT` / `DELETE` → 302 to leader if called on follower (use `-L`)
 - `GET` → served locally, no redirect
 - `/admin/*` → 307 to leader (307 preserves POST method, unlike 302)
+
+### Sidecar API (`:9090`)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/nodes` | All known nodes with Docker + Raft status |
+| `POST` | `/nodes/create` | Start a node and add to cluster |
+| `POST` | `/nodes/{id}/stop` | Remove from cluster and stop container |
+
+**`POST /nodes/create` body:**
+```json
+{ "id": "node4" }                              // preset node — ports from docker-compose
+{ "id": "node-alpha", "http_port": 8090 }      // custom node — http_port required
+{ "id": "node-alpha", "http_port": 8090, "rpc_port": 7090 }  // explicit RPC port
+```
 
 ---
 
@@ -1656,7 +1339,9 @@ curl http://localhost:8081/status
   "commit_index":        42,
   "last_applied":        42,
   "heartbeats_received": 0,
-  "heartbeats_sent":     1204
+  "heartbeats_sent":     1204,
+  "peers":               ["node2:7001", "node3:7001"],
+  "snapshot_index":      0
 }
 ```
 
@@ -1667,8 +1352,10 @@ curl http://localhost:8081/status
 | `leader` | Node ID of the known leader (`""` during election) |
 | `commit_index` | Highest log index committed by majority |
 | `last_applied` | Highest log index applied to state machine |
-| `heartbeats_received` | Total heartbeats received as follower (~20/sec) |
-| `heartbeats_sent` | Total heartbeat rounds sent as leader (~20/sec) |
+| `heartbeats_received` | Total heartbeats received as follower (~10/sec) |
+| `heartbeats_sent` | Total heartbeat rounds sent as leader (~10/sec) |
+| `peers` | Current cluster peer list (RPC addresses) |
+| `snapshot_index` | Log index of last snapshot (0 if none taken) |
 
 **Reading the counters:**
 - Leader: `heartbeats_sent` grows, `heartbeats_received` = 0
@@ -1714,16 +1401,37 @@ go run ./cmd/readstate /tmp/node1-snap.bin
 watch -n 1 'curl -s http://localhost:8081/status | python3 -m json.tool'
 ```
 
+### Inspect gRPC Endpoints (grpcurl)
+
+```bash
+# List available services
+grpcurl -plaintext localhost:7001 list
+# → raft.Raft
+
+# List methods
+grpcurl -plaintext localhost:7001 list raft.Raft
+# → raft.Raft.AppendEntries
+# → raft.Raft.InstallSnapshot
+# → raft.Raft.RequestVote
+
+# Send a RequestVote manually
+grpcurl -plaintext \
+  -d '{"term":1,"candidateId":"node1","lastLogIndex":0,"lastLogTerm":0}' \
+  localhost:7001 raft.Raft/RequestVote
+```
+
 ---
 
 ## Known Limitations
 
 | Limitation | Description | Production Solution |
 |---|---|---|
-| **Stale reads** | GET served locally — may be ~50ms behind leader | Read index or leader leases |
-| **Leader removal** | Must stop the leader first, then call remove-node | Leader transfer before removal |
+| **Stale reads** | GET served locally — may be ~100ms behind leader | Read index or leader leases |
+| **2-node quorum fragility** | A 2-node cluster requires both nodes for quorum; one failure blocks all writes | Always run 3+ nodes |
+| **Leader removal** | Must do a write after remove-node to cascade-commit the removal entry | Leader transfer before removal |
 | **Laptop sleep** | Goroutines freeze, timers expire, burst of elections on wake | Always-on servers |
 | **No learner state** | New node counts toward quorum immediately on AddPeer | Non-voting learner until caught up, then promote |
-| **Removed node re-election** | A removed node that missed its own removal can win elections | Check cluster membership in RequestVote |
 | **Single machine** | All nodes on one host = no real fault tolerance | Deploy across machines or availability zones |
-| **No TLS** | RPC and HTTP traffic is plaintext | Mutual TLS on all Raft RPC channels |
+| **No TLS** | gRPC Raft RPCs and KVStore HTTP traffic are plaintext | Mutual TLS on gRPC, TLS on HTTP API |
+| **Sidecar state in-memory** | Dynamic nodes (added via UI) are lost if sidecar restarts | Persist node registry to disk |
+| **Data cleared on re-add** | Nodes start fresh every re-add (no incremental catch-up) | Acceptable for dev/demo; production would rejoin with data intact |

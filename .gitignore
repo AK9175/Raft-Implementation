@@ -1,15 +1,48 @@
-# binaries
+# ── Go ────────────────────────────────────────────────────────────
 *.exe
 *.out
 /bin/
-
-# build cache
 /vendor/
-
-# test artifacts
 *.test
 *.prof
 coverage.out
 
-# OS
+# ── Node / Dashboard ──────────────────────────────────────────────
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+.pnp
+.pnp.js
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# ── Environment & secrets ─────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Raft node data (local runs outside Docker) ────────────────────
+raft-state.bin
+raft-log.bin
+snapshot.bin
+/data/
+
+# ── Build artifacts ───────────────────────────────────────────────
+dist/
+
+# ── Editor & OS ───────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+
+# ── Docker volumes (if bind-mounted locally) ──────────────────────
+/volumes/
+
+# ── Test / profiling ──────────────────────────────────────────────
+cpu.pprof
+mem.pprof

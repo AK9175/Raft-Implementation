@@ -2,7 +2,7 @@
 ## Comprehensive Technical Documentation
 
 **Course:** Distributed Systems — MS Software Engineering, SJSU  
-**Implementation:** Raft KV Store in Go with HTTP Transport and Docker  
+**Implementation:** Raft KV Store in Go with gRPC/Protobuf Transport and Docker  
 
 ---
 
@@ -424,7 +424,7 @@ A goroutine is a lightweight thread managed by the Go runtime. Goroutines are mu
 | `go n.startElection()` | Runs an election concurrently without blocking the event loop |
 | `go n.sendToPeer(peer, ...)` | Sends one AppendEntries RPC without blocking other peers |
 | `go n.sendSnapshotToPeer(...)` | Ships snapshot to lagging follower |
-| `go transport.Serve()` | Listens for incoming Raft RPC HTTP requests |
+| `go transport.Serve()` | Listens for incoming Raft gRPC requests (protobuf over HTTP/2) |
 
 ### Why spawn goroutines for RPCs?
 
@@ -634,10 +634,10 @@ type Transport interface {
 ```
 
 The same Raft node runs with:
-- `HTTPTransport` in Docker (real JSON over HTTP)
+- `GRPCTransport` in Docker (protobuf messages over HTTP/2 gRPC)
 - `MemoryTransport` in tests (direct function calls, no network)
 
-The node doesn't know or care which transport it has. Tests run 1000x faster because there's no actual network overhead.
+The node doesn't know or care which transport it has — it only calls the `Transport` interface. Tests run 1000x faster because there's no actual network overhead. Swapping HTTP/JSON for gRPC required zero changes to the Raft core.
 
 ```go
 type StateMachine interface {
@@ -658,11 +658,11 @@ defer cancel()
 reply, err := n.transport.AppendEntries(ctx, peer, args)
 ```
 
-`context.WithTimeout` creates a context that automatically cancels after the deadline. The HTTP client respects this — if the RPC takes longer than 50ms, `AppendEntries` returns with an error. The goroutine then exits cleanly rather than blocking indefinitely.
+`context.WithTimeout` creates a context that automatically cancels after the deadline. The gRPC client respects this — if the RPC takes longer than the deadline, `AppendEntries` returns with an error. The goroutine then exits cleanly rather than blocking indefinitely.
 
 `defer cancel()` is always called to release resources even if the context expires naturally.
 
-## 4.9 Encoding: Gob and JSON
+## 4.9 Encoding: Gob, Protobuf, and JSON
 
 **Gob** (Go Binary) — for persistent state on disk:
 
@@ -676,18 +676,39 @@ gob.NewDecoder(f).Decode(&state)
 
 Gob is Go-specific, compact, and efficient. It's used for `raft-state.bin` and `raft-snapshot.bin` because only Go processes read them and performance matters.
 
-**JSON** — for Raft RPCs over HTTP:
+**Protobuf** — for Raft RPCs between nodes (gRPC transport):
 
 ```go
-// In HTTP handler (server side)
-json.NewDecoder(r.Body).Decode(&args)
-json.NewEncoder(w).Encode(reply)
+// Defined once in proto/raft.proto
+message AppendEntriesArgs {
+    uint64 term    = 1;
+    string leader_id = 2;
+    ...
+}
 
-// In transport client side
-json.Marshal(body) → HTTP POST → json.Decode(reply)
+// Generated code handles serialization automatically
+// In transport_grpc.go — client side:
+pb.NewRaftClient(conn).AppendEntries(ctx, &pb.AppendEntriesArgs{...})
+
+// In transport_grpc.go — server side (grpcHandler):
+func (h *grpcHandler) AppendEntries(_ context.Context, req *pb.AppendEntriesArgs) (*pb.AppendEntriesReply, error)
 ```
 
-JSON is used for RPCs because it's human-readable (useful for debugging) and language-agnostic (could add a non-Go client).
+Protobuf is used for inter-node RPCs because it produces compact binary messages (~3x smaller than JSON), serializes/deserializes faster, and travels over HTTP/2 (multiplexed, persistent connections). The schema is defined once in `raft.proto` and `protoc` generates all the boilerplate.
+
+**JSON** — for the KVStore HTTP API (clients only):
+
+```go
+// Status endpoint
+json.NewEncoder(w).Encode(map[string]interface{}{
+    "node_id": nodeID, "state": node.State().String(), ...
+})
+
+// Admin endpoints
+json.NewDecoder(r.Body).Decode(&req)
+```
+
+JSON is used for the client-facing HTTP API because it's human-readable, works with `curl`, and browsers can consume it. It is **not** used for Raft inter-node RPCs.
 
 ---
 
@@ -706,9 +727,15 @@ raft/                       — core consensus layer
   snapshot.go               — TakeSnapshot, HandleInstallSnapshot, sendSnapshotToPeer
   rpc.go                    — RequestVoteArgs/Reply, AppendEntriesArgs/Reply, InstallSnapshotArgs
   transport.go              — Transport interface
-  transport_http.go         — HTTPTransport — JSON over HTTP
+  transport_grpc.go         — GRPCTransport — protobuf over HTTP/2 (production)
+  transport_http.go         — HTTPTransport — JSON over HTTP (legacy, kept for reference)
   transport_memory.go       — MemoryTransport — in-process, for tests
   state_machine.go          — StateMachine interface
+
+proto/
+  raft.proto                — gRPC service + message definitions (source of truth)
+  raft.pb.go                — generated protobuf message structs
+  raft_grpc.pb.go           — generated RaftClient + RaftServer interfaces
 
 kvstore/
   kvstore.go                — KVStore implementing StateMachine
@@ -1076,8 +1103,7 @@ To let the new node start catching up on missed entries immediately. Waiting unt
 | No pre-vote | Partitioned nodes accumulate high terms and disrupt cluster on reconnect | Pre-vote phase: check if you'd win before incrementing term |
 | No learner state | New node counts toward quorum immediately | Non-voting learner until caught up, then promote |
 | Single machine | All nodes on one host = no real fault tolerance | Deploy across machines or availability zones |
-| No TLS | RPC and HTTP traffic is plaintext | Mutual TLS on all Raft RPC channels |
-| HTTP transport | JSON parsing overhead, no multiplexing | gRPC with protobuf for production |
+| No TLS | gRPC Raft RPCs and KVStore HTTP traffic are plaintext | Mutual TLS on gRPC (`grpc.WithTransportCredentials`), TLS on HTTP API |
 | Silent persist errors | Disk write failure ignored | Crash the node — running with corrupt state is worse |
 
 ---

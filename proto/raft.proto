@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package raft;
+
+option go_package = "github.com/atharva/raft/proto";
+
+// Raft defines the three RPCs that nodes exchange.
+// RequestVote: candidates solicit votes during election (§5.2)
+// AppendEntries: leader replicates log entries and sends heartbeats (§5.3)
+// InstallSnapshot: leader ships a full snapshot to a lagging follower (§7)
+service Raft {
+  rpc RequestVote     (RequestVoteArgs)     returns (RequestVoteReply);
+  rpc AppendEntries   (AppendEntriesArgs)   returns (AppendEntriesReply);
+  rpc InstallSnapshot (InstallSnapshotArgs) returns (InstallSnapshotReply);
+}
+
+// LogEntry mirrors raft.LogEntry — one entry in the replicated log.
+message LogEntry {
+  uint64 term        = 1;
+  uint64 index       = 2;
+  bytes  command     = 3;
+  bool   is_config   = 4;
+  string config_op   = 5;
+  string config_peer = 6;
+}
+
+// ── RequestVote ────────────────────────────────────────────────────────────
+
+message RequestVoteArgs {
+  uint64 term           = 1; // candidate's current term
+  string candidate_id   = 2; // so voters know who is asking
+  uint64 last_log_index = 3; // index of candidate's last log entry
+  uint64 last_log_term  = 4; // term of candidate's last log entry
+}
+
+message RequestVoteReply {
+  uint64 term         = 1; // responder's current term (candidate may step down)
+  bool   vote_granted = 2;
+}
+
+// ── AppendEntries ──────────────────────────────────────────────────────────
+
+message AppendEntriesArgs {
+  uint64            term           = 1; // leader's current term
+  string            leader_id      = 2; // so followers can redirect clients
+  uint64            prev_log_index = 3; // index of entry immediately before new ones
+  uint64            prev_log_term  = 4; // term of prev_log_index entry
+  repeated LogEntry entries        = 5; // entries to store (empty = heartbeat)
+  uint64            leader_commit  = 6; // leader's commitIndex
+}
+
+message AppendEntriesReply {
+  uint64 term           = 1; // responder's current term (leader may step down)
+  bool   success        = 2; // true if follower's log matched prev_log_index/term
+
+  // Fast backtracking fields — only set when success == false.
+  // Lets the leader skip back a full term instead of one index at a time (§5.3).
+  uint64 conflict_term  = 3; // term of the conflicting entry; 0 if log too short
+  uint64 conflict_index = 4; // first index of conflict_term; or len(log)+1 if term==0
+}
+
+// ── InstallSnapshot ────────────────────────────────────────────────────────
+
+message InstallSnapshotArgs {
+  uint64 term                = 1; // leader's current term
+  string leader_id           = 2; // so follower can redirect clients
+  uint64 last_included_index = 3; // snapshot covers all entries up through this index
+  uint64 last_included_term  = 4; // term of the entry at last_included_index
+  bytes  data                = 5; // raw snapshot bytes from StateMachine.Snapshot()
+}
+
+message InstallSnapshotReply {
+  uint64 term = 1; // follower's current term, so leader can step down if stale
+}

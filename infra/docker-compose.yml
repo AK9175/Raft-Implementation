@@ -100,8 +100,29 @@ services:
     volumes:
       - node4-data:/data
 
+  node5:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    environment:
+      NODE_ID: node5
+      RAFT_RPC_ADDR: ":7001"
+      RAFT_PEERS: ""
+      HTTP_ADDR: ":8085"
+      PEER_HTTP_ADDRS: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083,node4=localhost:8084,node5=localhost:8085"
+      DATA_DIR: /data
+      ELECTION_TIMEOUT_MIN_MS: 500
+      ELECTION_TIMEOUT_MAX_MS: 1000
+      HEARTBEAT_INTERVAL_MS: 100
+    ports:
+      - "8085:8085"
+      - "7005:7001"
+    volumes:
+      - node5-data:/data
+
 volumes:
   node1-data:
   node2-data:
   node3-data:
   node4-data:
+  node5-data:

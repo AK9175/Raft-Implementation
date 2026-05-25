@@ -57,7 +57,7 @@ func main() {
 		log.Fatalf("mkdir %s: %v", dataDir, err)
 	}
 
-	transport := raft.NewHTTPTransport(raftRPCAddr)
+	transport := raft.NewGRPCTransport(raftRPCAddr)
 
 	cfg := raft.Config{
 		ID:                   nodeID,
@@ -73,11 +73,11 @@ func main() {
 	store, node := kvstore.New(cfg)
 	transport.Register(node) // wire Raft RPC server → node handlers
 
-	// Start Raft RPC server.
+	// Start Raft gRPC server.
 	go func() {
-		log.Printf("[%s] raft rpc listening on %s", nodeID, raftRPCAddr)
-		if err := transport.Serve(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("raft rpc server: %v", err)
+		log.Printf("[%s] raft grpc listening on %s", nodeID, raftRPCAddr)
+		if err := transport.Serve(); err != nil {
+			log.Fatalf("raft grpc server: %v", err)
 		}
 	}()
 
@@ -88,11 +88,12 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/keys/", makeHandler(store, node, peerHTTPAddrs))
 	mux.HandleFunc("/status", makeStatusHandler(nodeID, node))
+	mux.HandleFunc("/log", makeLogHandler(node))
 	mux.HandleFunc("/admin/add-node", makeAdminHandler(node, peerHTTPAddrs, "add"))
 	mux.HandleFunc("/admin/remove-node", makeAdminHandler(node, peerHTTPAddrs, "remove"))
 
 	log.Printf("[%s] kvstore http listening on %s", nodeID, httpAddr)
-	if err := http.ListenAndServe(httpAddr, mux); err != nil {
+	if err := http.ListenAndServe(httpAddr, corsMiddleware(mux)); err != nil {
 		log.Fatalf("http server: %v", err)
 	}
 }
@@ -121,7 +122,7 @@ func makeHandler(store *kvstore.KVStore, node *raft.RaftNode, peerHTTPAddrs map[
 				return
 			}
 			target := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.RequestURI())
-			http.Redirect(w, r, target, http.StatusFound)
+			http.Redirect(w, r, target, http.StatusTemporaryRedirect) // 307 preserves PUT/DELETE method
 			return
 		}
 
@@ -164,9 +165,6 @@ func makeHandler(store *kvstore.KVStore, node *raft.RaftNode, peerHTTPAddrs map[
 }
 
 // makeStatusHandler returns a handler that reports this node's Raft state as JSON.
-// Useful for verifying leader election, term progression, and cluster health.
-//
-//	curl http://localhost:8081/status
 func makeStatusHandler(nodeID string, node *raft.RaftNode) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -179,8 +177,56 @@ func makeStatusHandler(nodeID string, node *raft.RaftNode) http.HandlerFunc {
 			"last_applied":        node.LastApplied(),
 			"heartbeats_received": node.HeartbeatsReceived(),
 			"heartbeats_sent":     node.HeartbeatsSent(),
+			"peers":               node.Peers(),
+			"snapshot_index":      node.SnapshotIndex(),
 		})
 	}
+}
+
+// makeLogHandler returns a handler that exposes the node's current in-memory
+// log entries as JSON. Used by the dashboard to display the replication log.
+//
+//	curl http://localhost:8081/log
+func makeLogHandler(node *raft.RaftNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		entries := node.LogEntries()
+		type logEntry struct {
+			Index      uint64 `json:"index"`
+			Term       uint64 `json:"term"`
+			IsConfig   bool   `json:"is_config"`
+			ConfigOp   string `json:"config_op,omitempty"`
+			ConfigPeer string `json:"config_peer,omitempty"`
+			Command    string `json:"command,omitempty"`
+		}
+		out := make([]logEntry, len(entries))
+		for i, e := range entries {
+			out[i] = logEntry{
+				Index:      e.Index,
+				Term:       e.Term,
+				IsConfig:   e.IsConfig,
+				ConfigOp:   e.ConfigOp,
+				ConfigPeer: e.ConfigPeer,
+				Command:    string(e.Command),
+			}
+		}
+		json.NewEncoder(w).Encode(out)
+	}
+}
+
+// corsMiddleware adds CORS headers so the dashboard (running on a different
+// port) can call the KVStore HTTP API directly from the browser.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, DELETE, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func mustEnv(key string) string {
