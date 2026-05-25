@@ -346,31 +346,41 @@ npm run dev   # → http://localhost:5173
 
 ### Screenshots
 
-#### Cluster Topology — 4-node cluster, node3 as leader at term 248
+#### Cluster Topology — 4-node cluster, node1 as leader at term 253
 
 ![Dashboard — Cluster Topology](docs/screenshots/dashboard-topology.png)
 
-The topology view shows the live cluster at a glance. Each node is drawn as a circle whose color encodes its Raft role (green = leader, blue = follower, yellow = candidate). Dashed edges represent heartbeat channels from the leader to every follower. The animated ring around node3 confirms it is the current leader. The cards on the right duplicate the graph state in tabular form — term, leader ID, commit index, applied index, peer count, and HTTP port — updated on every 2-second poll.
+The topology view shows the live cluster at a glance. Each node is drawn as a circle whose color encodes its Raft role (green = leader, blue = follower, yellow = candidate). Dashed edges represent active heartbeat channels from the leader outward to every follower. The animated pulsing ring around node1 confirms it is the current leader. Node cards on the right duplicate the graph state in tabular form — term, leader ID, commit index, applied index, peer count, and HTTP port — refreshed on every 2-second poll.
 
 Key observations visible in this screenshot:
-- All four nodes have converged on **term 248** with **commit = applied = 6**, meaning the cluster is fully caught up.
-- **Cluster Control** (right panel) shows quorum OK with 4 nodes running and each node's Stop button for one-click removal.
-- The header bar shows `Leader: node3  term 248  4 nodes online` — a single-line cluster health summary always visible.
+- **node1** (leader, :8081), **node3** (:8083), **node4** (:8084), and **node5** (:8085) have all converged on **term 253** with **commit = applied = 9**, meaning the log is fully replicated and applied on every node.
+- **Cluster Control** shows `quorum OK` and lists all four running nodes with per-node Stop buttons for one-click removal.
+- The header bar shows `Leader: node1  term 253  4 nodes online` — a persistent cluster health summary always visible at the top regardless of scroll position.
+- The KV panel below shows a `GET name` targeting **node5** (follower), demonstrating the per-node read selector.
 
 #### KV Store Operations and Replication Log
 
 ![Dashboard — KV Store and Replication Log](docs/screenshots/dashboard-kv-log.png)
 
-The lower half of the dashboard at a 4-node cluster after several operations:
+The lower half of the dashboard after a full cluster lifecycle — nodes added, removed, and re-added, plus two KV writes:
 
 **KV Store panel (left):**
-- `GET name` was issued targeting **node4** (follower) directly — the result `ak` was returned locally from node4 without touching the leader. The footnote "Reading from node4 — locally served, may lag leader" makes the stale-read semantics explicit.
-- The Read From selector shows all four online nodes; the currently selected node4 is highlighted in blue. node3 (leader) is marked with a `leader` badge.
-- `PUT` and `DELETE` operations always route to the leader; the selector is hidden for those operations.
+- `GET name` was issued targeting **node5** (follower) directly — the result `atharva` was returned locally without touching the leader. The footnote "Reading from node5 — locally served, may lag leader" makes the stale-read semantics explicit.
+- The Read From selector shows all four online nodes; node5 is highlighted (selected). `node1` carries a `leader` badge. `PUT` and `DELETE` always route to the leader; the selector is hidden for those operations.
 
-**Replication Log panel (right):**
-- The source selector dropdown is open, showing all four nodes with node3 marked `★` as the leader.
-- Log entries at the bottom show the full history: index 1–6 cover an initial `CONFIG ADD node4:7001`, a `SET name=ak` write, then `CONFIG ADD` entries for node1–3 as the cluster was assembled. This is exactly what Raft appends to its log: data commands interleaved with membership change entries.
+**Cluster Control panel (right):**
+- Four nodes listed with state dot color coding: green for leader (node1), blue for followers (node3, node4, node5). All show `t253`. Each row has an HTTP port badge and a Stop button.
+
+**Replication Log (bottom):**
+- Sourced from **node1 ★** (the leader) — its log is the authoritative copy.
+- **Index 9, term 253** — `SET name atharva` — the most recent write.
+- **Index 8, term 251** — `CONFIG ADD node5:7001` — node5 rejoined the cluster.
+- **Index 7, term 249** — `CONFIG REMOVE node5:7001` — node5 was previously stopped via the UI.
+- **Index 4–6, term 23** — `CONFIG ADD node1/node2/node3:7001` — the original cluster formation.
+- **Index 2, term 10** — `SET name ak` — an earlier write, still present in the log (Raft never deletes committed entries).
+- **Index 1, term 10** — `CONFIG ADD node4:7001` — node4 was the first node joined to the bootstrap cluster.
+
+This log is a complete audit trail of the cluster's lifetime: membership changes and data writes interleaved in a single ordered sequence, exactly as Raft specifies.
 
 ---
 
