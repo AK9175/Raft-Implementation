@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { SidecarNodeInfo } from '../types';
-import { sidecarCreate, sidecarStop } from '../api';
+import { sidecarCreate, sidecarStop, sidecarPause, sidecarUnpause } from '../api';
 
 const STATE_COLOR: Record<string, string> = {
   leader:    'var(--leader)',
@@ -12,9 +12,9 @@ const STATE_DOT: Record<string, string> = {
   leader:    '#3fb950',
   follower:  '#58a6ff',
   candidate: '#d29922',
+  paused:    '#4b5563',
 };
 
-// Preset node IDs and their default ports (from docker-compose).
 const PRESET: Record<string, { httpPort: number; rpcPort: number }> = {
   node1: { httpPort: 8081, rpcPort: 7001 },
   node2: { httpPort: 8082, rpcPort: 7002 },
@@ -29,40 +29,43 @@ function StateDot({ state }: { state: string }) {
     <span style={{
       display: 'inline-block', width: 7, height: 7,
       borderRadius: '50%', background: color,
-      boxShadow: state === 'leader' ? `0 0 6px ${color}` : undefined,
+      boxShadow: state === 'leader' ? `0 0 5px ${color}` : undefined,
       flexShrink: 0,
     }} />
   );
 }
 
-function RunningRow({ node, onStop }: {
+function RunningRow({ node, onStop, onPause, onUnpause }: {
   node: SidecarNodeInfo;
-  onStop: (id: string) => Promise<void>;
+  onStop:    (id: string) => Promise<void>;
+  onPause:   (id: string) => Promise<void>;
+  onUnpause: (id: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
 
-  async function handle() {
+  async function handle(fn: (id: string) => Promise<void>) {
     setBusy(true);
-    try { await onStop(node.id); } finally { setBusy(false); }
+    try { await fn(node.id); } finally { setBusy(false); }
   }
 
-  const stateColor  = STATE_COLOR[node.raft_state] ?? 'var(--muted)';
-  const isLeader    = node.raft_state === 'leader';
-  const isStarting  = node.raft_state === '';
-  const isJoining   = !node.in_cluster && !isStarting;
+  const isPaused   = !!node.paused;
+  const stateColor = isPaused ? 'var(--muted)' : (STATE_COLOR[node.raft_state] ?? 'var(--muted)');
+  const isLeader   = node.raft_state === 'leader';
+  const isStarting = !isPaused && node.raft_state === '';
+  const isJoining  = !node.in_cluster && !isStarting && !isPaused;
 
   return (
     <div style={{
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       background: 'var(--bg)',
-      border: `1px solid ${isLeader ? 'var(--leader)' : 'var(--border)'}`,
-      borderRadius: 8, padding: '8px 12px',
-      gap: 8,
+      border: `1px solid ${isLeader ? 'var(--leader)' : isPaused ? 'var(--border)' : 'var(--border)'}`,
+      borderRadius: 6, padding: '7px 10px', gap: 8,
+      opacity: isPaused ? 0.7 : 1,
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
         {isStarting
           ? <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--muted)', display: 'inline-block', flexShrink: 0 }} />
-          : <StateDot state={node.raft_state} />
+          : <StateDot state={isPaused ? 'paused' : node.raft_state} />
         }
         <span style={{ fontWeight: 600, fontSize: 12, fontFamily: 'monospace', flexShrink: 0 }}>
           {node.id}
@@ -72,15 +75,14 @@ function RunningRow({ node, onStop }: {
             fontSize: 9, padding: '1px 5px', borderRadius: 3, flexShrink: 0,
             background: 'var(--border)', color: 'var(--muted)', fontWeight: 600,
             textTransform: 'uppercase', letterSpacing: '.4px',
-          }}>
-            custom
-          </span>
+          }}>custom</span>
         )}
-        {isStarting ? (
-          <span style={{ fontSize: 11, color: 'var(--muted)' }}>starting…</span>
-        ) : (
-          <span style={{ fontSize: 11, color: stateColor }}>{node.raft_state}</span>
-        )}
+        {isPaused
+          ? <span style={{ fontSize: 11, color: 'var(--muted)' }}>paused</span>
+          : isStarting
+            ? <span style={{ fontSize: 11, color: 'var(--muted)' }}>starting…</span>
+            : <span style={{ fontSize: 11, color: stateColor }}>{node.raft_state}</span>
+        }
         {node.term > 0 && (
           <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'monospace' }}>
             t{node.term}
@@ -91,19 +93,29 @@ function RunningRow({ node, onStop }: {
             fontSize: 9, color: 'var(--candidate)',
             background: 'rgba(210,153,34,.12)', border: '1px solid rgba(210,153,34,.25)',
             padding: '1px 6px', borderRadius: 4, flexShrink: 0,
-          }}>
-            joining
-          </span>
+          }}>joining</span>
         )}
       </div>
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
         <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'monospace' }}>
           :{node.http_port}
         </span>
+        {isPaused ? (
+          <button className="btn btn-ghost"
+            style={{ padding: '3px 10px', fontSize: 11 }}
+            disabled={busy} onClick={() => handle(onUnpause)}>
+            {busy ? '…' : 'Resume'}
+          </button>
+        ) : (
+          <button className="btn btn-ghost"
+            style={{ padding: '3px 10px', fontSize: 11, color: 'var(--candidate)', borderColor: 'rgba(210,153,34,.3)' }}
+            disabled={busy || isStarting} onClick={() => handle(onPause)}>
+            {busy ? '…' : 'Pause'}
+          </button>
+        )}
         <button className="btn btn-danger"
           style={{ padding: '3px 10px', fontSize: 11 }}
-          disabled={busy} onClick={handle}>
+          disabled={busy} onClick={() => handle(onStop)}>
           {busy ? '…' : 'Stop'}
         </button>
       </div>
@@ -111,41 +123,33 @@ function RunningRow({ node, onStop }: {
   );
 }
 
-function AddNodeForm({ onCreated }: { onCreated: () => void }) {
-  const [id, setId]             = useState('');
-  const [httpPort, setHttpPort] = useState('');
-  const [rpcPort, setRpcPort]   = useState('');
-  const [busy, setBusy]         = useState(false);
-  const [error, setError]       = useState('');
-  const [open, setOpen]         = useState(false);
+function nextAvailable(existingIds: string[]): number {
+  const used = new Set(
+    existingIds.flatMap(id => { const m = id.match(/^node(\d+)$/); return m ? [parseInt(m[1])] : []; })
+  );
+  let n = 1;
+  while (used.has(n)) n++;
+  return n;
+}
 
-  // Auto-fill ports for preset IDs; clear when switching to a custom ID.
-  useEffect(() => {
-    const preset = PRESET[id.trim()];
-    setHttpPort(preset ? String(preset.httpPort) : '');
-    setRpcPort(preset  ? String(preset.rpcPort)  : '');
-  }, [id]);
+function AddNodeForm({ existingIds, onCreated }: { existingIds: string[]; onCreated: () => void }) {
+  const [counter, setCounter] = useState(() => nextAvailable(existingIds));
+  const [busy, setBusy]       = useState(false);
+  const [error, setError]     = useState('');
 
-  const isPreset = !!PRESET[id.trim()];
+  useEffect(() => { setCounter(nextAvailable(existingIds)); }, [existingIds.length]);
+
+  const nodeId    = `node${counter}`;
+  const isPreset  = !!PRESET[nodeId];
+  const httpPort  = PRESET[nodeId]?.httpPort ?? 8080 + counter;
+  const rpcPort   = PRESET[nodeId]?.rpcPort  ?? 7000 + counter;
+  const alreadyUp = existingIds.includes(nodeId);
 
   async function submit() {
-    const nodeId = id.trim();
-    if (!nodeId) { setError('Node ID is required'); return; }
-
-    const http = parseInt(httpPort);
-    const rpc  = parseInt(rpcPort) || http + 100;
-
-    if (!isPreset && (!http || http < 1024 || http > 65535)) {
-      setError('HTTP port must be 1024 – 65535');
-      return;
-    }
-
-    setBusy(true);
-    setError('');
+    if (alreadyUp) return;
+    setBusy(true); setError('');
     try {
-      await sidecarCreate(nodeId, isPreset ? undefined : http, isPreset ? undefined : rpc);
-      setId(''); setHttpPort(''); setRpcPort('');
-      setOpen(false);
+      await sidecarCreate(nodeId, isPreset ? undefined : httpPort, isPreset ? undefined : rpcPort);
       onCreated();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -155,96 +159,59 @@ function AddNodeForm({ onCreated }: { onCreated: () => void }) {
   }
 
   return (
-    <div style={{ marginTop: 10 }}>
-      <button className="btn btn-ghost"
-        style={{ width: '100%', justifyContent: 'center', gap: 6, fontSize: 12 }}
-        onClick={() => { setOpen(o => !o); setError(''); }}>
-        <span style={{ fontSize: 15, lineHeight: 1, fontWeight: 300 }}>{open ? '−' : '+'}</span>
+    <div style={{ marginTop: 12, borderTop: '1px solid var(--border-2)', paddingTop: 12 }}>
+      <div style={{ fontSize: 10, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.6px', fontWeight: 500, marginBottom: 8 }}>
         Add Node
-      </button>
+      </div>
 
-      {open && (
+      <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
         <div style={{
-          marginTop: 8, padding: '14px 14px 12px',
-          background: 'var(--bg)', border: '1px solid var(--border)',
-          borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 10,
+          display: 'flex', alignItems: 'center', flex: 1,
+          background: 'var(--bg)',
+          border: `1px solid ${alreadyUp ? 'var(--candidate)' : 'var(--border)'}`,
+          borderRadius: 6, overflow: 'hidden', transition: 'border-color .15s',
         }}>
-          <div>
-            <label style={{
-              fontSize: 10, color: 'var(--muted)', textTransform: 'uppercase',
-              letterSpacing: .6, display: 'block', marginBottom: 5, fontWeight: 500,
-            }}>
-              Node ID
-            </label>
-            <input type="text" value={id}
-              placeholder="node1 – node5, or a custom ID"
-              onChange={e => setId(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && submit()}
-              style={{ width: '100%' }}
-            />
-            {isPreset && (
-              <div style={{ fontSize: 10, color: 'var(--follower)', marginTop: 4 }}>
-                Preset — ports auto-filled from docker-compose
-              </div>
-            )}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-            <div>
-              <label style={{
-                fontSize: 10, color: 'var(--muted)', textTransform: 'uppercase',
-                letterSpacing: .6, display: 'block', marginBottom: 5, fontWeight: 500,
-              }}>
-                HTTP Port{!isPreset && <span style={{ color: 'var(--offline)', marginLeft: 3 }}>*</span>}
-              </label>
-              <input type="text" value={httpPort}
-                placeholder={isPreset ? '(preset)' : '8086'}
-                readOnly={isPreset}
-                onChange={e => setHttpPort(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && submit()}
-                style={{ width: '100%' }}
-              />
-            </div>
-
-            <div>
-              <label style={{
-                fontSize: 10, color: 'var(--muted)', textTransform: 'uppercase',
-                letterSpacing: .6, display: 'block', marginBottom: 5, fontWeight: 500,
-              }}>
-                RPC Port
-                <span style={{ fontSize: 9, fontWeight: 400, marginLeft: 4, textTransform: 'none', letterSpacing: 0 }}>
-                  {isPreset ? '' : '(opt)'}
-                </span>
-              </label>
-              <input type="text" value={rpcPort}
-                placeholder={isPreset ? '(preset)' : httpPort ? String(parseInt(httpPort) + 100) : '7006'}
-                readOnly={isPreset}
-                onChange={e => setRpcPort(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && submit()}
-                style={{ width: '100%' }}
-              />
-            </div>
-          </div>
-
-          {error && (
-            <div style={{ fontSize: 11, color: 'var(--offline)', lineHeight: 1.4 }}>{error}</div>
-          )}
-
-          <button className="btn btn-primary"
-            style={{ width: '100%', justifyContent: 'center' }}
-            disabled={busy || !id.trim()}
-            onClick={submit}>
-            {busy ? 'Starting…' : 'Start Node'}
-          </button>
-
-          {!isPreset && (
-            <div style={{ fontSize: 10, color: 'var(--muted)', lineHeight: 1.6 }}>
-              Custom nodes run via <code style={{ fontFamily: 'monospace' }}>docker run</code> on the
-              compose network. At least one bootstrap node must be running first.
-            </div>
-          )}
+          <span style={{
+            padding: '0 8px 0 10px', fontSize: 13, fontFamily: 'monospace',
+            color: 'var(--muted)', userSelect: 'none',
+            borderRight: '1px solid var(--border)',
+            background: 'var(--surface-2)',
+            alignSelf: 'stretch', display: 'flex', alignItems: 'center', flexShrink: 0,
+          }}>
+            node-
+          </span>
+          <input
+            type="number" min={1} max={99}
+            value={counter}
+            onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v) && v >= 1) setCounter(v); }}
+            onKeyDown={e => e.key === 'Enter' && submit()}
+            style={{
+              background: 'transparent', border: 'none', outline: 'none',
+              color: 'var(--text)', fontSize: 13, fontFamily: 'monospace',
+              width: '100%', padding: '7px 10px',
+            }}
+          />
         </div>
-      )}
+        <button
+          className="btn btn-primary"
+          style={{ padding: '0 18px', flexShrink: 0 }}
+          disabled={busy || alreadyUp}
+          onClick={submit}
+        >
+          {busy ? '…' : 'Start'}
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
+        <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'monospace' }}>
+          {isPreset ? 'preset' : 'dynamic'} · http :{httpPort} · rpc :{rpcPort}
+        </span>
+        {alreadyUp && (
+          <span style={{ fontSize: 10, color: 'var(--candidate)' }}>already running</span>
+        )}
+      </div>
+
+      {error && <div style={{ fontSize: 11, color: 'var(--offline)', marginTop: 6 }}>{error}</div>}
     </div>
   );
 }
@@ -274,6 +241,26 @@ export default function MembershipPanel({ sidecarNodes, onRefresh }: Props) {
     }
   }
 
+  async function handlePause(nodeId: string) {
+    try {
+      await sidecarPause(nodeId);
+      onRefresh();
+      showFlash(true, `${nodeId} paused`);
+    } catch (e: unknown) {
+      showFlash(false, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function handleUnpause(nodeId: string) {
+    try {
+      await sidecarUnpause(nodeId);
+      onRefresh();
+      showFlash(true, `${nodeId} resumed`);
+    } catch (e: unknown) {
+      showFlash(false, e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const running  = sidecarNodes.filter(n => n.running);
   const quorumOk = running.filter(n => n.in_cluster).length >= 2;
 
@@ -285,9 +272,8 @@ export default function MembershipPanel({ sidecarNodes, onRefresh }: Props) {
           Sidecar not running — start it to manage nodes:
         </div>
         <div style={{
-          padding: '8px 12px', background: 'var(--bg)', borderRadius: 6,
+          padding: '7px 11px', background: 'var(--bg)', borderRadius: 6,
           fontFamily: 'monospace', fontSize: 12, border: '1px solid var(--border)',
-          color: 'var(--text)',
         }}>
           go run ./cmd/sidecar
         </div>
@@ -322,22 +308,20 @@ export default function MembershipPanel({ sidecarNodes, onRefresh }: Props) {
 
       {running.length === 0 ? (
         <div style={{
-          padding: '24px 0', textAlign: 'center',
+          padding: '20px 0', textAlign: 'center',
           color: 'var(--muted)', fontSize: 12, lineHeight: 1.7,
         }}>
-          No nodes running.
-          <br />
-          Use the form below to start one.
+          No nodes running.<br />Use the form below to start one.
         </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 4 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 4 }}>
           {running.map(n => (
-            <RunningRow key={n.id} node={n} onStop={handleStop} />
+            <RunningRow key={n.id} node={n} onStop={handleStop} onPause={handlePause} onUnpause={handleUnpause} />
           ))}
         </div>
       )}
 
-      <AddNodeForm onCreated={onRefresh} />
+      <AddNodeForm existingIds={running.map(n => n.id)} onCreated={onRefresh} />
     </div>
   );
 }

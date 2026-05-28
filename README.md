@@ -242,33 +242,20 @@ Raft decomposes consensus into three largely independent subproblems — leader 
 The project ships a browser-based dashboard for real-time cluster visualization and control. Instead of running `curl` commands manually, everything can be done from the UI.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Raft Cluster Dashboard                                          │
-│                                                                  │
-│  ┌─────────────────────────┐  ┌──────────────────────────────┐  │
-│  │   Cluster Topology      │  │   Node Details               │  │
-│  │   (SVG graph)           │  │   node1  LEADER  t5          │  │
-│  │                         │  │   node2  FOLLOWER t5         │  │
-│  │  node2 ─── node1(leader)│  │   node3  FOLLOWER t5         │  │
-│  │       \   /             │  └──────────────────────────────┘  │
-│  │        node3            │                                     │
-│  └─────────────────────────┘                                     │
-│                                                                  │
-│  ┌──────────────────────┐   ┌──────────────────────────────┐    │
-│  │  KV Store            │   │  Cluster Control             │    │
-│  │  GET  PUT  DELETE    │   │  • node1 leader  :8081  Stop │    │
-│  │  Key: [         ]    │   │  • node2 follower:8082  Stop │    │
-│  │  Value: [       ]    │   │  + Add Node                  │    │
-│  │  [ Run GET ]         │   └──────────────────────────────┘    │
-│  └──────────────────────┘                                        │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Replication Log  Source: node1 ★                        │   │
-│  │  Index  Term  Type    Command                            │   │
-│  │  10     5     SET     username = alice                   │   │
-│  │  9      5     SET     version = 2                        │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  header: Raft Cluster  │  ● Healthy  Leader: node1  Term 9  3 nodes  12:01  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                         │                                                    │
+│  TOPOLOGY               │  KV Store │ Chaos Lab │ Cluster │ Log │ Docs      │
+│  [SVG graph]            │──────────────────────────────────────────────────  │
+│                         │  (active tab content rendered here)                │
+│  NODES                  │                                                    │
+│  ● node1  LEADER  t9    │                                                    │
+│  ● node2  FOLLOWER t9   │                                                    │
+│  ● node3  FOLLOWER t9   │                                                    │
+│                         │                                                    │
+└─────────────────────────┴────────────────────────────────────────────────────┘
+  ←── 310px sidebar ────→  ←── tab content (scrollable) ──────────────────────→
 ```
 
 ### Sidecar (`cmd/sidecar`)
@@ -282,6 +269,10 @@ The sidecar is a lightweight Go HTTP server (`:9090`) that acts as the bridge be
 | `GET` | `/nodes` | Poll all known nodes concurrently, return combined Docker + Raft status |
 | `POST` | `/nodes/create` | Start a node (preset or dynamic), call add-node on the cluster leader |
 | `POST` | `/nodes/{id}/stop` | Remove from cluster, stop container, clean up |
+| `POST` | `/nodes/{id}/pause` | `docker pause` the container (SIGSTOP) — node appears as paused in dashboard |
+| `POST` | `/nodes/{id}/unpause` | `docker unpause` the container (SIGCONT) — node resumes |
+| `GET` | `/live-scenarios` | List available fault-injection scenarios with metadata |
+| `POST` | `/live-scenarios/{id}` | Run a scenario against the live Docker cluster; returns result + step logs |
 
 **Node types:**
 
@@ -327,15 +318,24 @@ npm install
 npm run dev   # → http://localhost:5173
 ```
 
+**Layout:**
+
+The dashboard uses a fixed-height sidebar + tab-bar layout:
+- **Left sidebar (310 px):** compact topology SVG + per-node status rows (state dot, role badge, term, commit index)
+- **Header:** health chip (Healthy / No Leader), leader name, term, node count, live poll timestamp
+- **Tab bar:** KV Store | Chaos Lab | Cluster | Log | Docs
+
 **Components:**
 
 | Component | Description |
 |---|---|
-| `ClusterGraph` | SVG topology graph with animated leader ring and dashed heartbeat edges |
+| `ClusterGraph` | SVG topology with animated leader ring and dashed heartbeat edges; `compact` prop for sidebar |
 | `NodeCard` | Per-node stats: term, leader, commit/applied index, peers, port |
 | `KVPanel` | GET/PUT/DELETE operations; GET lets you choose which node to read from |
-| `MembershipPanel` | Lists running nodes with state dot + Stop button; Add Node form |
+| `MembershipPanel` | Lists running nodes with Pause/Resume/Stop buttons; locked `node-[N]` counter form |
 | `LogViewer` | Replication log table with source selector across all online nodes |
+| `ChaosPanel` | Live fault-injection scenarios fetched from sidecar; Run button disabled below `min_nodes` |
+| `DocsPanel` | Docs tab with sub-tabs: Diagrams (10 Mermaid charts) \| README \| Full Docs |
 
 **Design decisions:**
 
@@ -343,6 +343,7 @@ npm run dev   # → http://localhost:5173
 - All node status flows through the sidecar; the browser never hits `:808x` ports for status
 - `GET` reads are routed to the user-selected node (stale read by design); `PUT`/`DELETE` go to the leader
 - `LogViewer` source dropdown is built from live online nodes, not a hardcoded list
+- Mermaid diagrams in `DocsPanel` set `innerHTML` directly (bypassing `dangerouslySetInnerHTML`) so the 2-second poll re-renders don't wipe the rendered SVGs
 
 ### Screenshots
 
@@ -411,23 +412,35 @@ This log is a complete audit trail of the cluster's lifetime: membership changes
 ├── kvstore/
 │   └── kvstore.go            # KVStore — implements StateMachine, linearizable Set/Get/Delete
 │
+├── chaos/
+│   ├── network.go            # ChaosNetwork — wraps MemoryNetwork with rule engine (drop/delay/loss)
+│   ├── injector.go           # ChaosInjector — PartitionNode, InjectPacketLoss, InjectDelay, CrashNode
+│   ├── harness.go            # TB interface, Harness struct, RunScenario, ListScenarios
+│   ├── scenarios.go          # 4 in-memory fault scenarios (split brain, stale log, isolation, loss)
+│   └── scenarios_test.go     # thin wrappers so go test runs each scenario via testing.T
+│
 ├── cmd/
 │   ├── kvstore/main.go       # binary entrypoint — wires Raft + KVStore + HTTP server
-│   ├── sidecar/main.go       # sidecar server :9090 — Docker lifecycle + Raft admin bridge
+│   ├── chaos/main.go         # HTTP server :9091 — exposes in-memory chaos scenarios via REST
+│   ├── sidecar/main.go       # sidecar server :9090 — Docker lifecycle + Raft admin + live chaos
 │   └── readstate/main.go     # debug tool — decodes raft-state.bin to human-readable JSON
 │
 ├── dashboard/
 │   ├── src/
-│   │   ├── App.tsx           # root component, 2-second poller, layout
+│   │   ├── App.tsx           # root — sidebar + tab-bar layout, 2-second poller, status chips
 │   │   ├── api.ts            # fetch helpers for sidecar + node HTTP APIs
 │   │   ├── types.ts          # TypeScript interfaces: NodeStatus, LogEntry, SidecarNodeInfo
-│   │   ├── index.css         # global dark-theme design system
+│   │   ├── index.css         # dark-theme design system + docs prose + mermaid block styles
+│   │   ├── docs/
+│   │   │   └── diagrams.md   # 10 Mermaid diagrams (state machine, sequences, architecture…)
 │   │   └── components/
-│   │       ├── ClusterGraph.tsx    # SVG topology with gradient nodes and animated edges
+│   │       ├── ClusterGraph.tsx    # SVG topology — compact prop for sidebar, full for standalone
 │   │       ├── NodeCard.tsx        # per-node stats card
 │   │       ├── KVPanel.tsx         # GET/PUT/DELETE UI with per-node read selector
-│   │       ├── MembershipPanel.tsx # cluster control: node list + Add Node form
-│   │       └── LogViewer.tsx       # replication log table with dynamic source selector
+│   │       ├── MembershipPanel.tsx # cluster control: node list + locked node-[N] counter form
+│   │       ├── LogViewer.tsx       # replication log table with dynamic source selector
+│   │       ├── ChaosPanel.tsx      # live fault-injection UI — fetches scenarios from sidecar
+│   │       └── DocsPanel.tsx       # Docs tab — Diagrams / README / Full Docs with Mermaid render
 │   ├── package.json
 │   └── vite.config.ts
 │
@@ -1202,14 +1215,14 @@ npm run dev
 ```
 
 **4. Add nodes from the UI:**
-- Click "Add Node" in the Cluster Control panel
-- Type `node1` → ports auto-fill from preset → click "Start Node"
-- Repeat for `node2`, `node3`
-- The cluster self-bootstraps; a leader is elected within ~1 second
+- Open the **Cluster** tab → the counter pre-fills at `node-1`
+- Click **Start** — the sidecar starts `node1` via `docker compose up --build`
+- Repeat for `node-2`, `node-3`; the cluster self-bootstraps and elects a leader within ~1 second
 
-**5. Add custom nodes:**
-- Type any ID (e.g. `node-alpha`), enter HTTP port (e.g. 8090), RPC port (optional)
-- The sidecar starts a container via `docker run` and calls `add-node` on the leader
+**5. Run chaos scenarios:**
+- Open the **Chaos Lab** tab — scenarios are fetched live from the sidecar
+- Buttons are disabled until the required minimum number of nodes is running
+- Each scenario pauses/unpauses Docker containers and streams step logs to the UI
 
 ### Clean Up Everything
 
@@ -1322,6 +1335,19 @@ curl http://localhost:8083/keys/name
 | `GET` | `/nodes` | All known nodes with Docker + Raft status |
 | `POST` | `/nodes/create` | Start a node and add to cluster |
 | `POST` | `/nodes/{id}/stop` | Remove from cluster and stop container |
+| `POST` | `/nodes/{id}/pause` | `docker pause` (SIGSTOP) — freezes container, node appears paused |
+| `POST` | `/nodes/{id}/unpause` | `docker unpause` (SIGCONT) — resumes frozen container |
+| `GET` | `/live-scenarios` | List fault-injection scenarios (`id`, `label`, `desc`, `min_nodes`) |
+| `POST` | `/live-scenarios/{id}` | Run scenario; returns `{ passed, duration_ms, logs[] }` |
+
+**Available live scenarios:**
+
+| ID | Min Nodes | Description |
+|---|---|---|
+| `isolate_leader` | 3 | Pause leader → new election → restore → verify step-down |
+| `lose_follower` | 3 | Pause one follower → quorum holds → restore |
+| `quorum_loss` | 3 | Pause majority → cluster stalls → restore all |
+| `leader_churn` | 3 | 3 rapid leader-failover cycles; watch term counter climb |
 
 **`POST /nodes/create` body:**
 ```json

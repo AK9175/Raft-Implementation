@@ -178,6 +178,16 @@ func (n *RaftNode) LeaderID() string {
 	return n.leaderID
 }
 
+// ID returns this node's stable identifier.
+func (n *RaftNode) ID() string { return n.id }
+
+// LastIndex returns the index of the last entry in the log (0 for a fresh log).
+func (n *RaftNode) LastIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.log.lastIndex()
+}
+
 // HeartbeatsReceived returns the total number of valid heartbeats this node
 // has accepted as a follower. Increments every ~50ms when a leader is present.
 func (n *RaftNode) HeartbeatsReceived() uint64 { return n.heartbeatsRecv.Load() }

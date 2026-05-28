@@ -4,6 +4,56 @@ import { KNOWN_NODES } from './types';
 const SIDECAR = 'http://localhost:9090';
 const base    = (port: number) => `http://localhost:${port}`;
 
+// ── Chaos / live-scenario API ─────────────────────────────────────────────────
+
+export interface ScenarioMeta {
+  id:        string;
+  label:     string;
+  desc:      string;
+  min_nodes: number;
+}
+
+export interface ScenarioResult {
+  name:        string;
+  passed:      boolean;
+  error?:      string;
+  duration_ms: number;
+  logs:        string[];
+}
+
+export async function sidecarPause(nodeId: string): Promise<void> {
+  const res = await fetch(`${SIDECAR}/nodes/${encodeURIComponent(nodeId)}/pause`, {
+    method: 'POST', signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function sidecarUnpause(nodeId: string): Promise<void> {
+  const res = await fetch(`${SIDECAR}/nodes/${encodeURIComponent(nodeId)}/unpause`, {
+    method: 'POST', signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function fetchLiveScenarios(): Promise<ScenarioMeta[]> {
+  try {
+    const res = await fetch(`${SIDECAR}/live-scenarios`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function runLiveScenario(id: string): Promise<ScenarioResult> {
+  const res = await fetch(`${SIDECAR}/live-scenarios/${encodeURIComponent(id)}`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
 // ── Sidecar API ───────────────────────────────────────────────────────────────
 
 export async function fetchSidecarNodes(): Promise<SidecarNodeInfo[]> {

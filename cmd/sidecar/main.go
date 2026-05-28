@@ -65,6 +65,7 @@ type NodeInfo struct {
 	NodeDef
 	Running            bool     `json:"running"`
 	InCluster          bool     `json:"in_cluster"`
+	Paused             bool     `json:"paused"`
 	RaftState          string   `json:"raft_state"`
 	Term               uint64   `json:"term"`
 	Leader             string   `json:"leader"`
@@ -74,6 +75,73 @@ type NodeInfo struct {
 	HeartbeatsSent     uint64   `json:"heartbeats_sent"`
 	HeartbeatsReceived uint64   `json:"heartbeats_received"`
 	SnapshotIndex      uint64   `json:"snapshot_index"`
+}
+
+// ── pause tracking ────────────────────────────────────────────────────────────
+
+var (
+	pausedMu    sync.RWMutex
+	pausedNodes = map[string]bool{}
+)
+
+func isPaused(id string) bool {
+	pausedMu.RLock()
+	defer pausedMu.RUnlock()
+	return pausedNodes[id]
+}
+
+func setPaused(id string, v bool) {
+	pausedMu.Lock()
+	defer pausedMu.Unlock()
+	if v {
+		pausedNodes[id] = true
+	} else {
+		delete(pausedNodes, id)
+	}
+}
+
+// ── live scenario types ───────────────────────────────────────────────────────
+
+type LiveScenarioMeta struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Desc     string `json:"desc"`
+	MinNodes int    `json:"min_nodes"`
+}
+
+type LiveScenarioResult struct {
+	Name   string   `json:"name"`
+	Passed bool     `json:"passed"`
+	Error  string   `json:"error,omitempty"`
+	DurMs  int64    `json:"duration_ms"`
+	Logs   []string `json:"logs"`
+}
+
+var liveScenarioList = []LiveScenarioMeta{
+	{
+		ID:       "isolate_leader",
+		Label:    "Isolate Leader",
+		Desc:     "Pauses the current leader container. The cluster elects a new leader. After 3 seconds the old leader is restored and rejoins as follower.",
+		MinNodes: 3,
+	},
+	{
+		ID:       "lose_follower",
+		Label:    "Lose a Follower",
+		Desc:     "Pauses one follower. The remaining nodes still hold quorum and the cluster continues. Follower is restored after 3 seconds.",
+		MinNodes: 3,
+	},
+	{
+		ID:       "quorum_loss",
+		Label:    "Quorum Loss",
+		Desc:     "Pauses the majority of nodes so the cluster drops below quorum. The leader cannot commit new entries. All nodes are restored after 4 seconds.",
+		MinNodes: 3,
+	},
+	{
+		ID:       "leader_churn",
+		Label:    "Leader Churn",
+		Desc:     "Performs 3 rapid leader-failover cycles in a row. Each round pauses the current leader, waits for a new one, then restores. Watch the term counter climb.",
+		MinNodes: 3,
+	},
 }
 
 // ── node registry ─────────────────────────────────────────────────────────────
@@ -159,7 +227,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/nodes", handleNodes)
 	mux.HandleFunc("/nodes/create", handleCreateNode)
-	mux.HandleFunc("/nodes/", handleNodeStop)
+	mux.HandleFunc("/nodes/", handleNodeAction)
+	mux.HandleFunc("/live-scenarios", handleListLiveScenarios)
+	mux.HandleFunc("/live-scenarios/", handleRunLiveScenario)
 
 	log.Printf("sidecar listening on %s  (compose: %s)", addr, composeFile)
 	if err := http.ListenAndServe(addr, corsMiddleware(mux)); err != nil {
@@ -184,9 +254,13 @@ func handleNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	ch := make(chan portResult, len(all))
 	for _, n := range all {
-		go func(port int) {
-			ch <- portResult{port, fetchRaftStatus(port)}
-		}(n.HTTPPort)
+		go func(nd NodeDef) {
+			if isPaused(nd.ID) {
+				ch <- portResult{nd.HTTPPort, nil} // skip HTTP for paused containers
+			} else {
+				ch <- portResult{nd.HTTPPort, fetchRaftStatus(nd.HTTPPort)}
+			}
+		}(n)
 	}
 
 	statusByPort := make(map[int]*raftStatus, len(all))
@@ -208,12 +282,13 @@ func handleNodes(w http.ResponseWriter, r *http.Request) {
 	result := make([]NodeInfo, len(all))
 	for i, n := range all {
 		st := statusByPort[n.HTTPPort]
-		running := st != nil
-		inCluster := allPeers[n.RPCAddr]
-		if running && st.State == "leader" {
+		paused := isPaused(n.ID)
+		running := st != nil || paused
+		inCluster := allPeers[n.RPCAddr] || paused
+		if st != nil && st.State == "leader" {
 			inCluster = true
 		}
-		info := NodeInfo{NodeDef: n, Running: running, InCluster: inCluster}
+		info := NodeInfo{NodeDef: n, Running: running, InCluster: inCluster, Paused: paused}
 		if st != nil {
 			info.RaftState          = st.State
 			info.Term               = st.Term
@@ -224,6 +299,8 @@ func handleNodes(w http.ResponseWriter, r *http.Request) {
 			info.HeartbeatsSent     = st.HeartbeatsSent
 			info.HeartbeatsReceived = st.HeartbeatsReceived
 			info.SnapshotIndex      = st.SnapshotIndex
+		} else if paused {
+			info.RaftState = "paused"
 		}
 		result[i] = info
 	}
@@ -289,20 +366,19 @@ func handleCreateNode(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"ok":true,"id":%q}`, req.ID)
 }
 
-// POST /nodes/{id}/stop — remove from cluster (if needed) + stop container.
-func handleNodeStop(w http.ResponseWriter, r *http.Request) {
+// POST /nodes/{id}/stop|pause|unpause
+func handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Path: /nodes/{id}/stop
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/nodes/"), "/")
-	if len(parts) != 2 || parts[1] != "stop" {
-		http.Error(w, "path must be /nodes/{id}/stop or POST /nodes/create", http.StatusBadRequest)
+	if len(parts) != 2 {
+		http.Error(w, "path must be /nodes/{id}/stop|pause|unpause", http.StatusBadRequest)
 		return
 	}
-	nodeID := parts[0]
+	nodeID, action := parts[0], parts[1]
 
 	node, ok := findNode(nodeID)
 	if !ok {
@@ -310,12 +386,71 @@ func handleNodeStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := stopNode(node); err != nil {
+	var err error
+	switch action {
+	case "stop":
+		err = stopNode(node)
+	case "pause":
+		err = pauseNode(node)
+	case "unpause":
+		err = unpauseNode(node)
+	default:
+		http.Error(w, "action must be stop, pause, or unpause", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"id":%q}`, nodeID)
+}
+
+// GET /live-scenarios
+func handleListLiveScenarios(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(liveScenarioList)
+}
+
+// POST /live-scenarios/{id}
+func handleRunLiveScenario(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/live-scenarios/")
+	if id == "" {
+		http.Error(w, "missing scenario id", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[chaos] running live scenario %q", id)
+	var result LiveScenarioResult
+	switch id {
+	case "isolate_leader":
+		result = runScenarioIsolateLeader()
+	case "lose_follower":
+		result = runScenarioLoseFollower()
+	case "quorum_loss":
+		result = runScenarioQuorumLoss()
+	case "leader_churn":
+		result = runScenarioLeaderChurn()
+	default:
+		http.Error(w, "unknown scenario: "+id, http.StatusNotFound)
+		return
+	}
+
+	if result.Passed {
+		log.Printf("[chaos] %q PASSED in %dms", id, result.DurMs)
+	} else {
+		log.Printf("[chaos] %q FAILED in %dms: %s", id, result.DurMs, result.Error)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 // ── start / stop logic ────────────────────────────────────────────────────────
@@ -458,6 +593,323 @@ func stopNode(node NodeDef) error {
 
 	log.Printf("[sidecar] %s stopped", node.ID)
 	return nil
+}
+
+// ── pause / unpause ───────────────────────────────────────────────────────────
+
+func pauseNode(node NodeDef) error {
+	log.Printf("[sidecar] pausing %s (dynamic=%v)", node.ID, node.Dynamic)
+	if node.Dynamic {
+		if out, err := exec.Command("docker", "pause", "raft-"+node.ID).CombinedOutput(); err != nil {
+			return fmt.Errorf("docker pause: %w\n%s", err, string(out))
+		}
+	} else {
+		if err := compose("pause", node.ID); err != nil {
+			return fmt.Errorf("docker compose pause: %w", err)
+		}
+	}
+	setPaused(node.ID, true)
+	log.Printf("[sidecar] %s paused", node.ID)
+	return nil
+}
+
+func unpauseNode(node NodeDef) error {
+	log.Printf("[sidecar] unpausing %s (dynamic=%v)", node.ID, node.Dynamic)
+	if node.Dynamic {
+		if out, err := exec.Command("docker", "unpause", "raft-"+node.ID).CombinedOutput(); err != nil {
+			return fmt.Errorf("docker unpause: %w\n%s", err, string(out))
+		}
+	} else {
+		if err := compose("unpause", node.ID); err != nil {
+			return fmt.Errorf("docker compose unpause: %w", err)
+		}
+	}
+	setPaused(node.ID, false)
+	log.Printf("[sidecar] %s unpaused", node.ID)
+	return nil
+}
+
+// ── live scenarios ────────────────────────────────────────────────────────────
+
+func runScenarioIsolateLeader() LiveScenarioResult {
+	name  := "isolate_leader"
+	start := time.Now()
+	var logs []string
+	ts := func() string { return time.Now().Format("15:04:05.000") }
+	logf := func(f string, a ...any) { logs = append(logs, fmt.Sprintf("["+ts()+"] "+f, a...)) }
+	fail := func(msg string) LiveScenarioResult {
+		return LiveScenarioResult{Name: name, Passed: false, Error: msg, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+	}
+
+	// 1. Find current leader.
+	all := allNodes()
+	var leaderNode *NodeDef
+	var leaderTerm uint64
+	for _, n := range all {
+		if isPaused(n.ID) { continue }
+		st := fetchRaftStatus(n.HTTPPort)
+		if st != nil && st.State == "leader" {
+			cp := n
+			leaderNode = &cp
+			leaderTerm = st.Term
+			break
+		}
+	}
+	if leaderNode == nil {
+		return fail("no leader found — is the cluster running?")
+	}
+	logf("Found leader: %s (term %d)", leaderNode.ID, leaderTerm)
+
+	// 2. Pause the leader.
+	if err := pauseNode(*leaderNode); err != nil {
+		return fail("pause failed: " + err.Error())
+	}
+	logf("Paused %s — waiting for the cluster to elect a new leader…", leaderNode.ID)
+
+	// 3. Poll until a different leader appears.
+	var newLeaderID string
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, n := range all {
+			if n.ID == leaderNode.ID || isPaused(n.ID) { continue }
+			if st := fetchRaftStatus(n.HTTPPort); st != nil && st.State == "leader" {
+				newLeaderID = n.ID
+				break
+			}
+		}
+		if newLeaderID != "" { break }
+		time.Sleep(300 * time.Millisecond)
+	}
+	if newLeaderID == "" {
+		unpauseNode(*leaderNode)
+		return fail("new leader not elected within timeout — not enough nodes online?")
+	}
+	logf("New leader elected: %s", newLeaderID)
+	logf("Holding partition for 3 s so the topology is visible…")
+	time.Sleep(3 * time.Second)
+
+	// 4. Restore.
+	if err := unpauseNode(*leaderNode); err != nil {
+		return fail("unpause failed: " + err.Error())
+	}
+	logf("Restored %s — it will receive a higher-term heartbeat and step down", leaderNode.ID)
+	time.Sleep(800 * time.Millisecond)
+	logf("Scenario complete ✓  old leader rejoined as follower")
+
+	return LiveScenarioResult{Name: name, Passed: true, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+}
+
+func runScenarioLoseFollower() LiveScenarioResult {
+	name  := "lose_follower"
+	start := time.Now()
+	var logs []string
+	ts := func() string { return time.Now().Format("15:04:05.000") }
+	logf := func(f string, a ...any) { logs = append(logs, fmt.Sprintf("["+ts()+"] "+f, a...)) }
+	fail := func(msg string) LiveScenarioResult {
+		return LiveScenarioResult{Name: name, Passed: false, Error: msg, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+	}
+
+	// 1. Find a follower.
+	all := allNodes()
+	var follower *NodeDef
+	var onlineCount int
+	for _, n := range all {
+		if isPaused(n.ID) { continue }
+		st := fetchRaftStatus(n.HTTPPort)
+		if st == nil { continue }
+		onlineCount++
+		if st.State == "follower" && follower == nil {
+			cp := n
+			follower = &cp
+		}
+	}
+	if follower == nil {
+		return fail("no follower found — need at least 2 nodes online")
+	}
+	if onlineCount < 2 {
+		return fail("only 1 node online; need at least 2 to maintain quorum after partition")
+	}
+	logf("Found follower: %s (%d nodes online)", follower.ID, onlineCount)
+
+	// 2. Pause the follower.
+	if err := pauseNode(*follower); err != nil {
+		return fail("pause failed: " + err.Error())
+	}
+	logf("Paused %s — cluster still holds quorum with %d/%d nodes", follower.ID, onlineCount-1, onlineCount)
+	logf("Holding partition for 3 s so the topology is visible…")
+	time.Sleep(3 * time.Second)
+
+	// 3. Verify the leader is still up.
+	hasLeader := false
+	for _, n := range all {
+		if n.ID == follower.ID || isPaused(n.ID) { continue }
+		if st := fetchRaftStatus(n.HTTPPort); st != nil && st.State == "leader" {
+			hasLeader = true
+			logf("Leader %s is still serving — quorum maintained ✓", n.ID)
+			break
+		}
+	}
+	if !hasLeader {
+		unpauseNode(*follower)
+		return fail("leader was lost after follower partition — unexpected quorum failure")
+	}
+
+	// 4. Restore.
+	if err := unpauseNode(*follower); err != nil {
+		return fail("unpause failed: " + err.Error())
+	}
+	logf("Restored %s — it will catch up via log replication", follower.ID)
+	time.Sleep(600 * time.Millisecond)
+	logf("Scenario complete ✓")
+
+	return LiveScenarioResult{Name: name, Passed: true, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+}
+
+func runScenarioQuorumLoss() LiveScenarioResult {
+	name  := "quorum_loss"
+	start := time.Now()
+	var logs []string
+	ts   := func() string { return time.Now().Format("15:04:05.000") }
+	logf := func(f string, a ...any) { logs = append(logs, fmt.Sprintf("["+ts()+"] "+f, a...)) }
+	fail := func(msg string) LiveScenarioResult {
+		return LiveScenarioResult{Name: name, Passed: false, Error: msg, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+	}
+
+	// 1. Collect all online, non-paused nodes.
+	all := allNodes()
+	var online []NodeDef
+	for _, n := range all {
+		if isPaused(n.ID) { continue }
+		if st := fetchRaftStatus(n.HTTPPort); st != nil {
+			online = append(online, n)
+		}
+	}
+	n := len(online)
+	if n < 3 {
+		return fail(fmt.Sprintf("need at least 3 running nodes, found %d", n))
+	}
+
+	// quorum = floor(n/2)+1; to break it we pause ceil(n/2) = (n+1)/2 nodes.
+	quorum   := n/2 + 1
+	toPause  := (n + 1) / 2
+	logf("Cluster: %d nodes, quorum=%d — pausing %d to break quorum", n, quorum, toPause)
+
+	var paused []NodeDef
+	for i := 0; i < toPause; i++ {
+		nd := online[i]
+		if err := pauseNode(nd); err != nil {
+			// best-effort: restore whatever we paused so far and bail
+			for _, p := range paused { unpauseNode(p) }
+			return fail(fmt.Sprintf("pause %s: %v", nd.ID, err))
+		}
+		paused = append(paused, nd)
+		logf("Paused %s (%d/%d)", nd.ID, i+1, toPause)
+	}
+	logf("Quorum lost — only %d/%d nodes reachable, leader cannot commit new entries", n-toPause, n)
+	logf("Holding for 4 s so the topology is visible…")
+	time.Sleep(4 * time.Second)
+
+	// 2. Restore all paused nodes.
+	for _, nd := range paused {
+		if err := unpauseNode(nd); err != nil {
+			logf("WARNING: unpause %s failed: %v", nd.ID, err)
+		} else {
+			logf("Restored %s", nd.ID)
+		}
+	}
+	time.Sleep(800 * time.Millisecond)
+	logf("Scenario complete ✓  cluster is recovering quorum")
+
+	return LiveScenarioResult{Name: name, Passed: true, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+}
+
+func runScenarioLeaderChurn() LiveScenarioResult {
+	name  := "leader_churn"
+	start := time.Now()
+	var logs []string
+	ts   := func() string { return time.Now().Format("15:04:05.000") }
+	logf := func(f string, a ...any) { logs = append(logs, fmt.Sprintf("["+ts()+"] "+f, a...)) }
+	fail := func(msg string) LiveScenarioResult {
+		return LiveScenarioResult{Name: name, Passed: false, Error: msg, DurMs: time.Since(start).Milliseconds(), Logs: logs}
+	}
+
+	all := allNodes()
+	const rounds = 3
+
+	for round := 1; round <= rounds; round++ {
+		logf("── Round %d/%d ──────────────────────────", round, rounds)
+
+		// Find current leader.
+		var leaderNode *NodeDef
+		var leaderTerm uint64
+		for _, n := range all {
+			if isPaused(n.ID) { continue }
+			if st := fetchRaftStatus(n.HTTPPort); st != nil && st.State == "leader" {
+				cp := n
+				leaderNode = &cp
+				leaderTerm = st.Term
+				break
+			}
+		}
+		if leaderNode == nil {
+			// Give the cluster a moment to settle and retry once.
+			time.Sleep(600 * time.Millisecond)
+			for _, n := range all {
+				if isPaused(n.ID) { continue }
+				if st := fetchRaftStatus(n.HTTPPort); st != nil && st.State == "leader" {
+					cp := n
+					leaderNode = &cp
+					leaderTerm = st.Term
+					break
+				}
+			}
+			if leaderNode == nil {
+				return fail(fmt.Sprintf("round %d: no leader found", round))
+			}
+		}
+		logf("Current leader: %s (term %d)", leaderNode.ID, leaderTerm)
+
+		// Pause the leader.
+		if err := pauseNode(*leaderNode); err != nil {
+			return fail(fmt.Sprintf("round %d: pause %s: %v", round, leaderNode.ID, err))
+		}
+		logf("Paused %s — waiting for new election…", leaderNode.ID)
+
+		// Wait for a different leader.
+		var newLeaderID string
+		var newTerm uint64
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, n := range all {
+				if n.ID == leaderNode.ID || isPaused(n.ID) { continue }
+				if st := fetchRaftStatus(n.HTTPPort); st != nil && st.State == "leader" {
+					newLeaderID = n.ID
+					newTerm = st.Term
+					break
+				}
+			}
+			if newLeaderID != "" { break }
+			time.Sleep(250 * time.Millisecond)
+		}
+		if newLeaderID == "" {
+			unpauseNode(*leaderNode)
+			return fail(fmt.Sprintf("round %d: new leader not elected within timeout", round))
+		}
+		logf("New leader: %s (term %d → %d, +%d)", newLeaderID, leaderTerm, newTerm, newTerm-leaderTerm)
+
+		// Hold briefly so the topology is visible.
+		time.Sleep(1500 * time.Millisecond)
+
+		// Restore old leader.
+		if err := unpauseNode(*leaderNode); err != nil {
+			return fail(fmt.Sprintf("round %d: unpause %s: %v", round, leaderNode.ID, err))
+		}
+		logf("Restored %s — stepping down as follower", leaderNode.ID)
+		time.Sleep(700 * time.Millisecond)
+	}
+
+	logf("Leader churn complete ✓  %d elections triggered", rounds)
+	return LiveScenarioResult{Name: name, Passed: true, DurMs: time.Since(start).Milliseconds(), Logs: logs}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

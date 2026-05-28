@@ -1,6 +1,6 @@
 export interface NodeStatus {
   node_id: string;
-  state: 'leader' | 'follower' | 'candidate';
+  state: 'leader' | 'follower' | 'candidate' | 'paused';
   term: number;
   leader: string;
   commit_index: number;
@@ -39,6 +39,7 @@ export interface SidecarNodeInfo {
   dynamic: boolean;
   running: boolean;
   in_cluster: boolean;
+  paused?: boolean;
   raft_state: string;
   term: number;
   leader: string;
