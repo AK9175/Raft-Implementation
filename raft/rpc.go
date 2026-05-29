@@ -2,11 +2,15 @@ package raft
 
 // RequestVoteArgs is sent by a candidate to gather votes.
 // Raft §5.2
+// IsPreVote=true means this is a pre-vote probe (§9.6): the candidate does not
+// increment its term and the responder does not update votedFor. Used to prevent
+// partitioned nodes from accumulating high terms that disrupt the cluster on rejoin.
 type RequestVoteArgs struct {
-	Term         uint64 // candidate's current term
+	Term         uint64 // candidate's current term (or term+1 for pre-vote)
 	CandidateID  string // so voters know who is asking
 	LastLogIndex uint64 // index of candidate's last log entry
 	LastLogTerm  uint64 // term of candidate's last log entry
+	IsPreVote    bool   // true = pre-vote probe; don't change any persistent state
 }
 
 // RequestVoteReply is the response to a RequestVote RPC.

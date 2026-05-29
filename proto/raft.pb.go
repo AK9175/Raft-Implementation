@@ -112,6 +112,7 @@ type RequestVoteArgs struct {
 	CandidateId   string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`       // so voters know who is asking
 	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"` // index of candidate's last log entry
 	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`    // term of candidate's last log entry
+	IsPreVote     bool                   `protobuf:"varint,5,opt,name=is_pre_vote,json=isPreVote,proto3" json:"is_pre_vote,omitempty"`          // true = pre-vote probe (term not incremented, no state change)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -172,6 +173,13 @@ func (x *RequestVoteArgs) GetLastLogTerm() uint64 {
 		return x.LastLogTerm
 	}
 	return 0
+}
+
+func (x *RequestVoteArgs) GetIsPreVote() bool {
+	if x != nil {
+		return x.IsPreVote
+	}
+	return false
 }
 
 type RequestVoteReply struct {
@@ -512,12 +520,13 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\tis_config\x18\x04 \x01(\bR\bisConfig\x12\x1b\n" +
 	"\tconfig_op\x18\x05 \x01(\tR\bconfigOp\x12\x1f\n" +
 	"\vconfig_peer\x18\x06 \x01(\tR\n" +
-	"configPeer\"\x92\x01\n" +
+	"configPeer\"\xb2\x01\n" +
 	"\x0fRequestVoteArgs\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12$\n" +
 	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
-	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\"I\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x1e\n" +
+	"\vis_pre_vote\x18\x05 \x01(\bR\tisPreVote\"I\n" +
 	"\x10RequestVoteReply\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xdd\x01\n" +

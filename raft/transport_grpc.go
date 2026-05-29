@@ -76,6 +76,7 @@ func (t *GRPCTransport) RequestVote(ctx context.Context, addr string, args Reque
 		CandidateId:  args.CandidateID,
 		LastLogIndex: args.LastLogIndex,
 		LastLogTerm:  args.LastLogTerm,
+		IsPreVote:    args.IsPreVote,
 	})
 	if err != nil {
 		return RequestVoteReply{}, err
@@ -149,6 +150,7 @@ func (h *grpcHandler) RequestVote(_ context.Context, req *pb.RequestVoteArgs) (*
 		CandidateID:  req.CandidateId,
 		LastLogIndex: req.LastLogIndex,
 		LastLogTerm:  req.LastLogTerm,
+		IsPreVote:    req.IsPreVote,
 	})
 	return &pb.RequestVoteReply{
 		Term:        reply.Term,

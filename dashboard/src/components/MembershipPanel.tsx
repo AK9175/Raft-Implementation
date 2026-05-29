@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { SidecarNodeInfo } from '../types';
-import { sidecarCreate, sidecarStop, sidecarPause, sidecarUnpause } from '../api';
+import { sidecarCreate, sidecarStop, sidecarPause, sidecarUnpause, sidecarRestart } from '../api';
 
 const STATE_COLOR: Record<string, string> = {
   leader:    'var(--leader)',
@@ -35,11 +35,12 @@ function StateDot({ state }: { state: string }) {
   );
 }
 
-function RunningRow({ node, onStop, onPause, onUnpause }: {
+function RunningRow({ node, onStop, onPause, onUnpause, onRestart }: {
   node: SidecarNodeInfo;
   onStop:    (id: string) => Promise<void>;
   onPause:   (id: string) => Promise<void>;
   onUnpause: (id: string) => Promise<void>;
+  onRestart: (id: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
 
@@ -100,6 +101,17 @@ function RunningRow({ node, onStop, onPause, onUnpause }: {
         <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'monospace' }}>
           :{node.http_port}
         </span>
+        <button className="btn btn-ghost"
+          style={{
+            padding: '3px 10px', fontSize: 11,
+            // Highlight Restart for orphaned nodes — it's the clean rejoin path.
+            color: isJoining ? 'var(--follower)' : undefined,
+            borderColor: isJoining ? 'rgba(88,166,255,.4)' : undefined,
+          }}
+          disabled={busy} onClick={() => handle(onRestart)}
+          title="Stop and start cleanly — re-joins the current cluster">
+          {busy ? '…' : 'Restart'}
+        </button>
         {isPaused ? (
           <button className="btn btn-ghost"
             style={{ padding: '3px 10px', fontSize: 11 }}
@@ -261,8 +273,22 @@ export default function MembershipPanel({ sidecarNodes, onRefresh }: Props) {
     }
   }
 
-  const running  = sidecarNodes.filter(n => n.running);
-  const quorumOk = running.filter(n => n.in_cluster).length >= 2;
+  async function handleRestart(nodeId: string) {
+    try {
+      await sidecarRestart(nodeId);
+      onRefresh();
+      showFlash(true, `${nodeId} restarted`);
+    } catch (e: unknown) {
+      showFlash(false, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const running       = sidecarNodes.filter(n => n.running);
+  const clusterNodes  = running.filter(n => n.in_cluster);
+  const orphaned      = running.filter(n => !n.in_cluster && !n.paused);
+  const hasLeader     = running.some(n => n.raft_state === 'leader');
+  const quorumOk      = hasLeader && clusterNodes.length >= 2;
+  const electing      = !hasLeader && clusterNodes.length >= 2;
 
   if (!sidecarOk) {
     return (
@@ -287,14 +313,13 @@ export default function MembershipPanel({ sidecarNodes, onRefresh }: Props) {
         Cluster Control
         {running.length > 0 && (
           <span style={{
-            fontSize: 9, fontWeight: 500, letterSpacing: .4,
-            textTransform: 'none',
-            color: quorumOk ? 'var(--leader)' : 'var(--candidate)',
-            background: quorumOk ? 'rgba(63,185,80,.1)' : 'rgba(210,153,34,.1)',
-            border: `1px solid ${quorumOk ? 'rgba(63,185,80,.25)' : 'rgba(210,153,34,.25)'}`,
+            fontSize: 9, fontWeight: 500, letterSpacing: .4, textTransform: 'none',
+            color:       quorumOk ? 'var(--leader)'    : electing ? 'var(--candidate)' : 'var(--offline)',
+            background:  quorumOk ? 'rgba(63,185,80,.1)' : electing ? 'rgba(210,153,34,.1)' : 'rgba(248,81,73,.08)',
+            border: `1px solid ${quorumOk ? 'rgba(63,185,80,.25)' : electing ? 'rgba(210,153,34,.25)' : 'rgba(248,81,73,.25)'}`,
             padding: '2px 7px', borderRadius: 4,
           }}>
-            {quorumOk ? 'quorum OK' : 'no quorum'}
+            {quorumOk ? 'quorum OK' : electing ? 'electing…' : 'no quorum'}
           </span>
         )}
       </div>
@@ -314,11 +339,35 @@ export default function MembershipPanel({ sidecarNodes, onRefresh }: Props) {
           No nodes running.<br />Use the form below to start one.
         </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 4 }}>
-          {running.map(n => (
-            <RunningRow key={n.id} node={n} onStop={handleStop} onPause={handlePause} onUnpause={handleUnpause} />
-          ))}
-        </div>
+        <>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 4 }}>
+            {clusterNodes.map(n => (
+              <RunningRow key={n.id} node={n} onStop={handleStop} onPause={handlePause} onUnpause={handleUnpause} onRestart={handleRestart} />
+            ))}
+          </div>
+
+          {orphaned.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                fontSize: 10, color: 'var(--offline)', marginBottom: 6,
+                padding: '5px 8px', borderRadius: 5,
+                background: 'rgba(248,81,73,.06)', border: '1px solid rgba(248,81,73,.18)',
+              }}>
+                <span>⚠</span>
+                <span>
+                  Not in cluster — stale term may disrupt leader if added.
+                  Stop and restart via the form below to rejoin cleanly.
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, opacity: 0.75 }}>
+                {orphaned.map(n => (
+                  <RunningRow key={n.id} node={n} onStop={handleStop} onPause={handlePause} onUnpause={handleUnpause} onRestart={handleRestart} />
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <AddNodeForm existingIds={running.map(n => n.id)} onCreated={onRefresh} />

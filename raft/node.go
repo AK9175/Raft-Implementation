@@ -95,8 +95,9 @@ type RaftNode struct {
 	lastApplied uint64 // index of highest log entry applied to state machine
 
 	// --- leader-only volatile state (reinitialized after each election) ---
-	nextIndex  map[string]uint64 // for each peer: next log index to send
-	matchIndex map[string]uint64 // for each peer: highest log index known to be replicated
+	nextIndex    map[string]uint64   // for each peer: next log index to send
+	matchIndex   map[string]uint64   // for each peer: highest log index known to be replicated
+	lastHeardFrom map[string]time.Time // for CheckQuorum: when we last got a reply from each peer
 
 	// --- dependencies ---
 	transport    Transport
@@ -104,7 +105,8 @@ type RaftNode struct {
 	config       Config
 
 	// --- cluster ---
-	leaderID string // ID of the node we last heard from as leader ("" if unknown)
+	leaderID          string    // ID of the node we last heard from as leader ("" if unknown)
+	lastLeaderContact time.Time // when we last received a valid AppendEntries from the leader
 
 	// --- snapshot ---
 	snapshotData    []byte               // latest snapshot bytes (nil until first snapshot)
@@ -132,7 +134,7 @@ func NewRaftNode(cfg Config) *RaftNode {
 		cfg.ElectionTimeoutMaxMs = 300
 	}
 	if cfg.HeartbeatIntervalMs == 0 {
-		cfg.HeartbeatIntervalMs = 50
+		cfg.HeartbeatIntervalMs = 50 // Raftly default: 50ms heartbeat, 150-300ms election
 	}
 
 	n := &RaftNode{
@@ -281,6 +283,13 @@ func (n *RaftNode) AddPeer(rpcAddr string) error {
 	if n.state != Leader {
 		return ErrNotLeader
 	}
+	// Never add self — the leader fast-path in submitConfigLocked appends
+	// to n.peers immediately, before the config entry commits. Without this
+	// guard, calling add-node("node2:7001") on node2 itself would insert the
+	// node into its own peer list, inflating the majority threshold.
+	if rpcAddr == n.config.SelfAddr {
+		return nil
+	}
 	for _, p := range n.peers {
 		if p == rpcAddr {
 			return nil // already a member
@@ -336,6 +345,12 @@ func (n *RaftNode) submitConfigLocked(op, addr string) error {
 		n.peers = append(n.peers, addr)
 		n.nextIndex[addr] = index // send from this entry onward; snapshot catches it up if needed
 		n.matchIndex[addr] = 0
+		// Seed lastHeardFrom so CheckQuorum doesn't immediately fire for the
+		// newly added peer before the first heartbeat reply arrives.
+		if n.lastHeardFrom == nil {
+			n.lastHeardFrom = make(map[string]time.Time)
+		}
+		n.lastHeardFrom[addr] = time.Now()
 	}
 
 	for _, peer := range n.peers {
@@ -369,6 +384,10 @@ func (n *RaftNode) applyConfigEntry(entry LogEntry) {
 		if n.state == Leader {
 			n.nextIndex[entry.ConfigPeer] = n.log.lastIndex() + 1
 			n.matchIndex[entry.ConfigPeer] = 0
+			if n.lastHeardFrom == nil {
+				n.lastHeardFrom = make(map[string]time.Time)
+			}
+			n.lastHeardFrom[entry.ConfigPeer] = time.Now()
 		}
 
 	case "remove":
@@ -453,6 +472,32 @@ func (n *RaftNode) notifyCommit() {
 	}
 }
 
+// checkQuorum steps the leader down if it has not heard from a majority of
+// peers within one election-timeout window. A partitioned leader that can no
+// longer reach a quorum should yield so the reachable majority can elect a new
+// one — otherwise it blocks writes and may serve stale reads indefinitely.
+// Must be called with n.mu held.
+func (n *RaftNode) checkQuorum() {
+	if n.state != Leader {
+		return
+	}
+	// Use the maximum election timeout as the window — this is more conservative
+	// than ElectionTimeoutMin and handles gRPC/Docker network jitter without
+	// triggering spurious step-downs.
+	threshold := time.Duration(n.config.ElectionTimeoutMaxMs) * time.Millisecond
+	now := time.Now()
+	heard := 1 // count self
+	for _, peer := range n.peers {
+		if t, ok := n.lastHeardFrom[peer]; ok && now.Sub(t) < threshold {
+			heard++
+		}
+	}
+	majority := (len(n.peers)+1)/2 + 1
+	if heard < majority {
+		n.becomeFollower(n.currentTerm)
+	}
+}
+
 // --- main event loop ---
 
 // Run starts the node's event loop. Must be called in its own goroutine.
@@ -477,15 +522,26 @@ func (n *RaftNode) Run() {
 			return
 
 		case <-electionTimer.C:
-			// No heartbeat received before timeout — start an election.
-			// Skip if we have no peers: we can never win and would only
-			// accumulate a high term that disrupts the cluster on join.
+			// No heartbeat received before timeout.
+			// Run pre-vote in a goroutine so the event loop stays live
+			// (heartbeats and stop signals must still be processed during the probe).
 			n.mu.Lock()
-			if n.state != Leader && len(n.peers) > 0 {
-				n.becomeCandidate()
-				go n.startElection()
-			}
+			eligible := n.state != Leader && len(n.peers) > 0
 			n.mu.Unlock()
+
+			if eligible {
+				go func() {
+					if n.startPreVote() {
+						n.mu.Lock()
+						// Re-check: state may have changed while pre-vote was running.
+						if n.state != Leader && len(n.peers) > 0 {
+							n.becomeCandidate()
+							go n.startElection()
+						}
+						n.mu.Unlock()
+					}
+				}()
+			}
 			resetTimer(electionTimer, n.randomElectionTimeout())
 
 		case <-n.heartbeatC:
@@ -493,9 +549,10 @@ func (n *RaftNode) Run() {
 			resetTimer(electionTimer, n.randomElectionTimeout())
 
 		case <-heartbeatTicker.C:
-			// Send heartbeats if we are the leader.
+			// Send heartbeats if we are the leader; check quorum.
 			n.mu.Lock()
 			if n.state == Leader {
+				n.checkQuorum()
 				n.sendHeartbeats()
 			}
 			n.mu.Unlock()

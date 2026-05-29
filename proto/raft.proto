@@ -31,6 +31,7 @@ message RequestVoteArgs {
   string candidate_id   = 2; // so voters know who is asking
   uint64 last_log_index = 3; // index of candidate's last log entry
   uint64 last_log_term  = 4; // term of candidate's last log entry
+  bool   is_pre_vote    = 5; // true = pre-vote probe (term not incremented, no state change)
 }
 
 message RequestVoteReply {

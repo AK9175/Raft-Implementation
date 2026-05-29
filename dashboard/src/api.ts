@@ -35,6 +35,13 @@ export async function sidecarUnpause(nodeId: string): Promise<void> {
   if (!res.ok) throw new Error(await res.text());
 }
 
+export async function sidecarRestart(nodeId: string): Promise<void> {
+  const res = await fetch(`${SIDECAR}/nodes/${encodeURIComponent(nodeId)}/restart`, {
+    method: 'POST', signal: AbortSignal.timeout(60000), // stop + rebuild + add-node can take a while
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export async function fetchLiveScenarios(): Promise<ScenarioMeta[]> {
   try {
     const res = await fetch(`${SIDECAR}/live-scenarios`, { signal: AbortSignal.timeout(3000) });

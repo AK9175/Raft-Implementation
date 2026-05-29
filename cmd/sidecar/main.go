@@ -269,13 +269,33 @@ func handleNodes(w http.ResponseWriter, r *http.Request) {
 		statusByPort[r.port] = r.st
 	}
 
-	allPeers := map[string]bool{}
-	for _, st := range statusByPort {
-		if st == nil {
-			continue
+	// Build authoritative membership from the leader's peer list.
+	// Falling back to the union of all peer lists causes orphaned nodes from
+	// old sessions to declare each other "in_cluster", polluting the quorum
+	// badge and the cluster panel.
+	var leaderNode *NodeDef
+	leaderPeers := map[string]bool{}
+	for i, n := range all {
+		if st := statusByPort[n.HTTPPort]; st != nil && st.State == "leader" {
+			nd := all[i]
+			leaderNode = &nd
+			leaderPeers[n.RPCAddr] = true
+			for _, p := range st.Peers {
+				leaderPeers[p] = true
+			}
+			break
 		}
-		for _, p := range st.Peers {
-			allPeers[p] = true
+	}
+	// Fallback used only when no leader has been elected yet.
+	fallbackPeers := map[string]bool{}
+	if leaderNode == nil {
+		for _, st := range statusByPort {
+			if st == nil {
+				continue
+			}
+			for _, p := range st.Peers {
+				fallbackPeers[p] = true
+			}
 		}
 	}
 
@@ -284,7 +304,12 @@ func handleNodes(w http.ResponseWriter, r *http.Request) {
 		st := statusByPort[n.HTTPPort]
 		paused := isPaused(n.ID)
 		running := st != nil || paused
-		inCluster := allPeers[n.RPCAddr] || paused
+		var inCluster bool
+		if leaderNode != nil {
+			inCluster = leaderPeers[n.RPCAddr] || paused
+		} else {
+			inCluster = fallbackPeers[n.RPCAddr] || paused
+		}
 		if st != nil && st.State == "leader" {
 			inCluster = true
 		}
@@ -394,8 +419,10 @@ func handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		err = pauseNode(node)
 	case "unpause":
 		err = unpauseNode(node)
+	case "restart":
+		err = restartNode(node)
 	default:
-		http.Error(w, "action must be stop, pause, or unpause", http.StatusBadRequest)
+		http.Error(w, "action must be stop, pause, unpause, or restart", http.StatusBadRequest)
 		return
 	}
 	if err != nil {
@@ -459,12 +486,21 @@ func handleRunLiveScenario(w http.ResponseWriter, r *http.Request) {
 func startPresetNode(node NodeDef) error {
 	log.Printf("[sidecar] starting preset %s (bootstrap=%v)", node.ID, node.Bootstrap)
 
-	// Wipe the persisted state (term, log, vote) before starting.
-	// A node restarting with a stale high term will cause the cluster leader to
-	// step down the moment it receives a message from it, triggering unnecessary
-	// re-elections. A clean start means the node rejoins as a fresh learner and
-	// catches up via log replication or snapshot.
-	clearNodeData(node.ID)
+	// Decide whether to wipe persisted state before starting.
+	//
+	// Old behaviour (always clear): a bootstrap node (node1–3) loses its Raft
+	// state, sees RAFT_PEERS in the environment, and immediately self-forms a
+	// brand-new 3-node cluster — separate from whatever cluster is already
+	// running. That is worse than a temporary term disruption.
+	//
+	// New behaviour: only clear when there is no existing cluster. When a
+	// cluster is already live, keep the persisted state so the node re-joins
+	// via normal log replication / snapshot catch-up. A stale term is
+	// disruptive for one election cycle; a split cluster is permanent.
+	existingPort := findOnlinePortExcluding(node.HTTPPort)
+	if existingPort == 0 {
+		clearNodeData(node.ID)
+	}
 
 	if err := compose("up", "-d", "--no-deps", "--build", node.ID); err != nil {
 		return fmt.Errorf("docker compose up: %w", err)
@@ -475,23 +511,20 @@ func startPresetNode(node NodeDef) error {
 		return fmt.Errorf("%s did not come online: %w", node.ID, err)
 	}
 
-	// Find an existing cluster to join.
-	port := findOnlinePortExcluding(node.HTTPPort)
-
-	if node.Bootstrap && port == 0 {
+	if node.Bootstrap && existingPort == 0 {
 		// No other cluster exists yet — rely on RAFT_PEERS to self-bootstrap.
 		log.Printf("[sidecar] %s up (no cluster yet — self-bootstrapping via RAFT_PEERS)", node.ID)
 		return nil
 	}
 
-	if port == 0 {
+	if existingPort == 0 {
 		return fmt.Errorf("no cluster nodes online; start at least one node first")
 	}
 
-	log.Printf("[sidecar] calling add-node for %s via :%d", node.RPCAddr, port)
-	if err := raftAddNode(port, node.RPCAddr); err != nil {
+	log.Printf("[sidecar] adding %s to cluster (retrying up to 30s for leader)…", node.RPCAddr)
+	if err := retryAddNode(node.HTTPPort, node.RPCAddr, 30*time.Second); err != nil {
 		if node.Bootstrap {
-			// Non-fatal for bootstrap nodes: already-a-member is OK on first start.
+			// Non-fatal for bootstrap nodes: already-a-member is OK on rejoin.
 			log.Printf("[sidecar] add-node for bootstrap %s: %v (may already be a member)", node.ID, err)
 			return nil
 		}
@@ -527,9 +560,9 @@ func createDynamicNode(id string, httpPort, rpcPort int) error {
 		"-e", "RAFT_PEERS=",
 		"-e", "DATA_DIR=/data",
 		"-e", "PEER_HTTP_ADDRS=" + peerHTTPAddrs,
-		"-e", "ELECTION_TIMEOUT_MIN_MS=500",
-		"-e", "ELECTION_TIMEOUT_MAX_MS=1000",
-		"-e", "HEARTBEAT_INTERVAL_MS=100",
+		"-e", "ELECTION_TIMEOUT_MIN_MS=250",
+		"-e", "ELECTION_TIMEOUT_MAX_MS=500",
+		"-e", "HEARTBEAT_INTERVAL_MS=50",
 		image,
 	}
 
@@ -552,12 +585,8 @@ func createDynamicNode(id string, httpPort, rpcPort int) error {
 		return fmt.Errorf("%s did not come online: %w", id, err)
 	}
 
-	port := findOnlinePortExcluding(httpPort)
-	if port == 0 {
-		return fmt.Errorf("no cluster nodes online to call add-node; start bootstrap nodes first")
-	}
-	log.Printf("[sidecar] calling add-node for %s via :%d", rpcAddr, port)
-	if err := raftAddNode(port, rpcAddr); err != nil {
+	log.Printf("[sidecar] adding %s to cluster (retrying up to 30s for leader)…", rpcAddr)
+	if err := retryAddNode(httpPort, rpcAddr, 30*time.Second); err != nil {
 		return fmt.Errorf("add-node: %w", err)
 	}
 
@@ -593,6 +622,40 @@ func stopNode(node NodeDef) error {
 
 	log.Printf("[sidecar] %s stopped", node.ID)
 	return nil
+}
+
+// restartNode stops a node and starts it again cleanly. This is the one-click
+// path for rejoining an orphaned ("joining") node: stopNode calls remove-node
+// and tears down the container, then the start path wipes stale state (when no
+// cluster exists) and calls add-node against the current leader.
+//
+// For dynamic nodes we capture the ports before stopping, because stopNode
+// removes the node from the runtime registry.
+func restartNode(node NodeDef) error {
+	log.Printf("[sidecar] restarting %s", node.ID)
+
+	// A paused container can't be stopped cleanly — resume it first.
+	if isPaused(node.ID) {
+		if err := unpauseNode(node); err != nil {
+			log.Printf("[sidecar] restart: unpause warning: %v (continuing)", err)
+		}
+	}
+
+	// Capture identity before stopNode removes dynamic nodes from the registry.
+	id, httpPort, rpcPort, dynamic := node.ID, node.HTTPPort, node.RPCPort, node.Dynamic
+
+	if err := stopNode(node); err != nil {
+		return fmt.Errorf("restart: stop failed: %w", err)
+	}
+
+	// Brief settle so the container is fully down and ports are released
+	// before we bring it back up.
+	time.Sleep(1 * time.Second)
+
+	if dynamic {
+		return createDynamicNode(id, httpPort, rpcPort)
+	}
+	return startPresetNode(node)
 }
 
 // ── pause / unpause ───────────────────────────────────────────────────────────
@@ -1080,6 +1143,33 @@ func findOnlinePortExcluding(exclude int) int {
 		return r.node.HTTPPort
 	}
 	return 0
+}
+
+// retryAddNode calls raftAddNode repeatedly until it succeeds or the timeout
+// expires. During leader elections there may be no leader for several seconds;
+// retrying prevents nodes from getting stuck in "joining" forever just because
+// the single add-node attempt landed during an election.
+func retryAddNode(excludePort int, rpcAddr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		port := findOnlinePortExcluding(excludePort)
+		if port == 0 {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if err := raftAddNode(port, rpcAddr); err != nil {
+			lastErr = err
+			log.Printf("[sidecar] add-node for %s failed (will retry): %v", rpcAddr, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("add-node timed out for %s: %w", rpcAddr, lastErr)
+	}
+	return fmt.Errorf("add-node timed out for %s: no cluster leader found", rpcAddr)
 }
 
 func raftAddNode(port int, rpcAddr string) error {

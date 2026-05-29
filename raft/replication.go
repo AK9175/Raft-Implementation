@@ -93,9 +93,15 @@ func (n *RaftNode) sendToPeer(peer string, term uint64, args AppendEntriesArgs) 
 		return
 	}
 
+	// Any reply means the peer is reachable — record it for CheckQuorum
+	// regardless of whether it accepted or rejected the entries.
+	if n.lastHeardFrom == nil {
+		n.lastHeardFrom = make(map[string]time.Time)
+	}
+	n.lastHeardFrom[peer] = time.Now()
+
 	if reply.Success {
 		// Peer accepted the entries — advance its tracking indices.
-		//PrevlogIndex + no of new entries that are appended.
 		newMatch := args.PrevLogIndex + uint64(len(args.Entries))
 		if newMatch > n.matchIndex[peer] {
 			n.matchIndex[peer] = newMatch
@@ -180,6 +186,7 @@ func (n *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRepl
 
 	// Valid message from the current leader — reset our election timer and record who it is.
 	n.leaderID = args.LeaderID
+	n.lastLeaderContact = time.Now() // used by pre-vote to reject spurious elections
 	n.notifyHeartbeat()
 
 	// --- Log consistency check (Raft §5.3) ---

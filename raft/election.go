@@ -38,14 +38,77 @@ func (n *RaftNode) becomeLeader() {
 	n.state = Leader
 	n.leaderID = n.id // we are the leader
 	lastIndex := n.log.lastIndex()
+	now := time.Now()
+	if n.lastHeardFrom == nil {
+		n.lastHeardFrom = make(map[string]time.Time, len(n.peers))
+	}
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = lastIndex + 1
 		n.matchIndex[peer] = 0
+		n.lastHeardFrom[peer] = now // seed so CheckQuorum doesn't fire immediately
 	}
-	// Heartbeats are sent in Checkpoint 4 (sendHeartbeats)
 }
 
 // --- election ---
+
+// startPreVote runs a pre-vote round before committing to a real election.
+// Raft §9.6: the candidate probes peers with its *next* term (term+1) without
+// actually incrementing its own term or clearing votedFor. Peers grant a
+// pre-vote only if they haven't heard from a leader recently AND the candidate's
+// log is at least as up-to-date. If a majority grants, we proceed to a real
+// election; otherwise we stay follower and avoid accumulating a high term.
+//
+// Returns true if the node should proceed to a real election.
+// Must be called WITHOUT n.mu held; acquires it internally.
+func (n *RaftNode) startPreVote() bool {
+	n.mu.Lock()
+	nextTerm := n.currentTerm + 1
+	args := RequestVoteArgs{
+		Term:         nextTerm, // the term we WOULD use
+		CandidateID:  n.id,
+		LastLogIndex: n.log.lastIndex(),
+		LastLogTerm:  n.log.lastTerm(),
+		IsPreVote:    true,
+	}
+	peers := make([]string, len(n.peers))
+	copy(peers, n.peers)
+	n.mu.Unlock()
+
+	if len(peers) == 0 {
+		return false
+	}
+
+	majority := (len(peers)+1)/2 + 1
+	votes := 1 // count self
+
+	type result struct{ granted bool }
+	ch := make(chan result, len(peers))
+
+	for _, peer := range peers {
+		go func(peer string) {
+			ctx, cancel := context.WithTimeout(context.Background(),
+				time.Duration(n.config.ElectionTimeoutMinMs)*time.Millisecond)
+			defer cancel()
+			reply, err := n.transport.RequestVote(ctx, peer, args)
+			if err != nil {
+				ch <- result{false}
+				return
+			}
+			ch <- result{reply.VoteGranted}
+		}(peer)
+	}
+
+	for range peers {
+		r := <-ch
+		if r.granted {
+			votes++
+			if votes >= majority {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // startElection runs in its own goroutine after becomeCandidate().
 // It sends RequestVote to all peers in parallel and calls becomeLeader()
@@ -66,9 +129,8 @@ func (n *RaftNode) startElection() {
 	n.mu.Unlock()
 
 	// votes starts at 1 — we already voted for ourselves in becomeCandidate.
-	// Accessed only under n.mu, so no separate mutex needed.
 	votes := 1
-	majority := (len(peers)+1)/2 + 1 // (total nodes) / 2 + 1
+	majority := (len(peers)+1)/2 + 1
 
 	for _, peer := range peers {
 		go func(peer string) {
@@ -91,10 +153,6 @@ func (n *RaftNode) startElection() {
 			}
 
 			// Ignore stale replies — we may have moved to a new term or already won.
-			//So basically this is running inside a goroutine, so each RPC vote reply
-			//Will run this code, and as soon as we get the majority vote, the node becomes
-			//Leader and changes its state from Candidate to Leader, so any new vote will
-			//result in return (line no 321).
 			if n.state != Candidate || n.currentTerm != term {
 				return
 			}
@@ -105,8 +163,6 @@ func (n *RaftNode) startElection() {
 
 			votes++
 			if votes >= majority {
-				// n.state == Candidate check above ensures we only call this once:
-				// after becomeLeader sets state=Leader, subsequent goroutines return early.
 				n.becomeLeader()
 			}
 		}(peer)
@@ -123,6 +179,31 @@ func (n *RaftNode) startElection() {
 func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// ── Pre-vote path ────────────────────────────────────────────────────────
+	// Pre-vote is a stateless probe: we neither update our term nor record a
+	// vote. We grant only if we haven't heard from a leader recently (i.e. we
+	// would time out and start an election ourselves) AND the candidate's log
+	// is at least as up-to-date as ours.
+	if args.IsPreVote {
+		reply := RequestVoteReply{Term: n.currentTerm}
+		// Reject if we have heard from a valid leader recently (within one
+		// election-timeout window). This is the core pre-vote rule from Raft
+		// §9.6: a node that is receiving heartbeats would not time out and
+		// start an election, so it should not help the candidate either.
+		// Using a timestamp rather than leaderID avoids the race where leaderID
+		// is "" for a brief window right after a new leader is elected.
+		threshold := time.Duration(n.config.ElectionTimeoutMinMs) * time.Millisecond
+		if time.Since(n.lastLeaderContact) < threshold {
+			return reply // healthy leader exists — reject pre-vote
+		}
+		candidateUpToDate := args.LastLogTerm > n.log.lastTerm() ||
+			(args.LastLogTerm == n.log.lastTerm() && args.LastLogIndex >= n.log.lastIndex())
+		reply.VoteGranted = candidateUpToDate
+		return reply
+	}
+
+	// ── Real vote path ───────────────────────────────────────────────────────
 	if args.Term > n.currentTerm {
 		n.becomeFollower(args.Term)
 	}
@@ -130,7 +211,6 @@ func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	reply := RequestVoteReply{Term: n.currentTerm}
 
 	// Reject if candidate is behind us in term.
-	//So this means no vote was granted to the candidate requesting vote
 	if args.Term < n.currentTerm {
 		return reply
 	}
@@ -139,9 +219,6 @@ func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	canVote := n.votedFor == "" || n.votedFor == args.CandidateID
 
 	// Condition 2: candidate's log is at least as up-to-date as ours.
-	// Higher last term wins outright — a newer term means a more recent leader,
-	// whose entries are more authoritative regardless of log length.
-	// Only when last terms are equal does log length break the tie.
 	// Raft §5.4.1
 	candidateUpToDate := args.LastLogTerm > n.log.lastTerm() ||
 		(args.LastLogTerm == n.log.lastTerm() && args.LastLogIndex >= n.log.lastIndex())

@@ -223,23 +223,30 @@ func TestHigherTermStepsDown(t *testing.T) {
 	}
 }
 
-// TestElectionTimerFires verifies that a node becomes a candidate
-// when no heartbeat is received before the election timeout.
+// TestElectionTimerFires verifies pre-vote behaviour: a node whose peers are
+// unreachable must NOT increment its term or become a candidate.  Before
+// pre-vote, an isolated node would blindly becomeCandidate() and accumulate a
+// high term that disrupts the cluster on re-join.  With pre-vote, it stays
+// follower until it can confirm a majority would support it.
 func TestElectionTimerFires(t *testing.T) {
+	// newTestNode uses noopTransport — all RPCs fail immediately, simulating
+	// a fully partitioned node.
 	n, _ := newTestNode(t, "node1")
-
-	// use a very short timeout so the test doesn't take long
 	n.config.ElectionTimeoutMinMs = 50
 	n.config.ElectionTimeoutMaxMs = 75
 
 	go n.Run()
 	defer n.Stop()
 
-	// wait longer than the max election timeout
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
-	if n.State() == Follower {
-		t.Fatal("expected node to have left Follower state after election timeout")
+	// Pre-vote must prevent the isolated node from leaving Follower or
+	// incrementing its term — peers never respond so majority is never reached.
+	if n.State() != Follower {
+		t.Fatalf("isolated node should remain Follower (pre-vote); got %v", n.State())
+	}
+	if n.CurrentTerm() != 0 {
+		t.Fatalf("isolated node must not increment term; got %d", n.CurrentTerm())
 	}
 }
 
